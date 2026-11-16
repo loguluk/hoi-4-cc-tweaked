@@ -54,7 +54,7 @@ end
 local function layout()
   W, H = mon.getSize()
   mapW = W
-  mapH = math.max(1, H - 3)
+  mapH = math.max(1, H - 4)
 end
 
 local function viewSize()
@@ -114,6 +114,7 @@ local dirty = false         -- нужно ли перерисовать карт
 local mode = nil            -- режим приказа: { all = true/false }
 local msgText = ""
 local logLines = {}
+local helpOpen = false
 
 math.randomseed(os.epoch("utc"))
 
@@ -611,53 +612,101 @@ local function changeZoom(dir)
   return true
 end
 
+local centerView
+
+local function drawHelp()
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  put(1, 1, "HOW TO PLAY", colors.black, colors.lightBlue)
+  local lines = {
+    "Tap province = select it.",
+    "1 DIV / ALL: choose army,",
+    "then tap a neighboring province.",
+    "WAR: select enemy land, tap WAR.",
+    "ZOOM - / +: change map scale.",
+    "CENTER: center on selected province.",
+    "PLAY / PAUSE: control time.",
+    "MENU: return to menu.",
+    "Keyboard: arrows pan the map.",
+    "PageUp/Down: zoom; R: center.",
+    "M/A: move 1/all; W: declare war.",
+    "Space: pause; Backspace: cancel.",
+    "Esc: menu; Q: quit.",
+    "HELP/H: show this guide.",
+  }
+  for i, line in ipairs(lines) do
+    put(1, i + 2, line, colors.white)
+  end
+  put(1, H, "Tap anywhere or press a key", colors.lightGray)
+end
+
 local function drawPanel()
   local line = msgText
-  if line == "" and selected then
+  if line == "" and mode and selected then
+    line = mode.all and "Tap neighbor: all divisions" or "Tap neighbor: 1 division"
+  elseif line == "" and selected then
     local p = provinces[selected]
-    line = p.name .. " " .. p.owner .. (p.cap and " *" or "")
+    line = p.name .. " " .. p.owner .. " | 1 DIV / ALL"
   elseif line == "" then
-    line = "Touch a province to select"
+    line = "Tap province, then action"
   end
 
   mon.setBackgroundColor(colors.gray)
   mon.setTextColor(colors.white)
-  mon.setCursorPos(1, H - 1)
-  mon.write(string.rep(" ", W))
-  mon.setCursorPos(1, H)
-  mon.write(string.rep(" ", W))
+  for y = H - 2, H do
+    mon.setCursorPos(1, y)
+    mon.write(string.rep(" ", W))
+  end
 
   touchButtons = {}
-  local function button(index, label, fn)
+  local function button(row, index, label, fn)
     local x1 = math.floor((index - 1) * W / 5) + 1
     local x2 = math.floor(index * W / 5)
+    if row == 1 and index >= 3 then x2 = math.min(W, x2 + 1) end
+    if row == 1 and index >= 4 then x1 = x1 + 1 end
     local width = x2 - x1 + 1
-    touchButtons[#touchButtons + 1] = { x1 = x1, x2 = x2, fn = fn }
-    put(x1, H - 1, string.rep(" ", width), colors.black, colors.lightGray)
+    local y = row == 1 and H - 2 or H - 1
+    touchButtons[#touchButtons + 1] = { x1 = x1, x2 = x2, y = y, fn = fn }
+    put(x1, y, string.rep(" ", width), colors.black, colors.lightGray)
     label = label:sub(1, width)
-    put(x1 + math.floor((width - #label) / 2), H - 1, label, colors.black, colors.lightGray)
+    put(x1 + math.floor((width - #label) / 2), y, label, colors.black, colors.lightGray)
   end
-  button(1, "-", function() return changeZoom(-1) end)
-  button(2, "+", function() return changeZoom(1) end)
-  button(3, "CENTER", function()
-    local vw, vh = viewSize()
-    if selected then
-      vx = provinces[selected].cx - vw / 2
-      vy = provinces[selected].cy - vh / 2
-    else
-      vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
-    end
-    clampView()
-    return true
-  end)
-  button(4, paused and "PLAY" or "PAUSE", function()
+  button(1, 1, "ZOOM-", function() return changeZoom(-1) end)
+  button(1, 2, "ZOOM+", function() return changeZoom(1) end)
+  button(1, 3, "CENTER", function() centerView(); return true end)
+  button(1, 4, paused and "PLAY" or "PAUSE", function()
     paused = not paused
     timerId = nil
     restartTimer()
     return false
   end)
-  button(5, "MENU", function() enterMenu(); return false end)
+  button(1, 5, "MENU", function() enterMenu(); return false end)
+  button(2, 1, "1 DIV", function()
+    if selected then mode = { all = false }; msgText = "Tap a neighbor"
+    else msgText = "Select a source first" end
+    return false
+  end)
+  button(2, 2, "ALL", function()
+    if selected then mode = { all = true }; msgText = "Tap a neighbor"
+    else msgText = "Select a source first" end
+    return false
+  end)
+  button(2, 3, "WAR", function() declareWar(); return true end)
+  button(2, 4, "HELP", function()
+    paused = true
+    timerId = nil
+    helpOpen = true
+    drawHelp()
+    return false
+  end)
+  button(2, 5, "CANCEL", function()
+    mode = nil
+    msgText = "Order cancelled"
+    return false
+  end)
 
+  mon.setTextColor(colors.white)
+  mon.setBackgroundColor(colors.gray)
   mon.setCursorPos(1, H)
   mon.write(line:sub(1, W))
 end
@@ -673,20 +722,23 @@ end
 
 ------------------------------------------------------------ ввод
 local function onTouch(x, y)
-  if y == H - 1 then
-    for _, button in ipairs(touchButtons) do
-      if x >= button.x1 and x <= button.x2 then
-        local redraw = button.fn()
-        if inMenu then return end
-        if redraw then drawMap() end
-        drawTopBar()
-        drawPanel()
-        return
-      end
-    end
+  if helpOpen then
+    helpOpen = false
+    redrawAll()
     return
   end
-  if x >= 1 and x <= mapW and y >= 2 and y <= H - 2 then
+  for _, button in ipairs(touchButtons) do
+    if y == button.y and x >= button.x1 and x <= button.x2 then
+      local redraw = button.fn()
+      if inMenu then return end
+      if helpOpen then return end
+      if redraw then drawMap() end
+      drawTopBar()
+      drawPanel()
+      return
+    end
+  end
+  if x >= 1 and x <= mapW and y >= 2 and y <= H - 3 then
     local p = pAt(x, y - 1)
     if mode and selected then
       local m = mode
@@ -806,7 +858,7 @@ local function pan(dx, dy)
   clampView()
 end
 
-local function centerView()
+centerView = function()
   local vw, vh = viewSize()
   if selected then
     vx = provinces[selected].cx - vw / 2
@@ -818,12 +870,23 @@ local function centerView()
 end
 
 local function onGameKey(code)
+  if helpOpen then
+    helpOpen = false
+    redrawAll()
+    return
+  end
   local mapChanged = false
   if code == keys.q then
     quit = true
     return
   elseif code == keys.escape then
     enterMenu()
+    return
+  elseif code == keys.h then
+    paused = true
+    timerId = nil
+    helpOpen = true
+    drawHelp()
     return
   elseif code == keys.space then
     paused = not paused
