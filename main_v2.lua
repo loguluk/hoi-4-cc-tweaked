@@ -41,7 +41,7 @@ end
 local function layout()
   W, H = mon.getSize()
   mapW = W
-  mapH = math.max(1, H - 2)
+  mapH = math.max(1, H - 3)
 end
 
 local function viewSize()
@@ -78,6 +78,7 @@ local speed = 2
 local SPEEDS = { 1.0, 0.5, 0.2, 0.05 }
 local date = { y = 1936, m = 1, d = 1 }
 local timerId = nil
+local touchButtons = {}
 
 ------------------------------------------------------------ игровая логика (без отрисовки)
 local MOVE_DAYS = 3
@@ -339,7 +340,15 @@ local function newGame()
   spawnDivisions()
   zi = 2
   local vw, vh = viewSize()
-  vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
+  selected = player and capitalOf(player) or nil
+  if selected then
+    local p = provinces[selected]
+    vx, vy = p.cx - vw / 2, p.cy - vh / 2
+    msgText = "Start: " .. p.name .. " " .. player
+  else
+    vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
+  end
+  clampView()
 end
 
 local function advanceDay()
@@ -473,7 +482,8 @@ local function drawMap()
       local cx = math.floor((p.cx - 0.5 - vx) * z) + 1
       local cy = math.floor((p.cy - 0.5 - vy) * z) + 1
       if cx >= 1 and cx <= mapW and cy >= 1 and cy <= mapH then
-        local name = (p.cap and "*" or "") .. p.name
+        local mark = (i == selected and p.owner == player) and ">" or (p.cap and "*" or "")
+        local name = mark .. p.name
         name = name:sub(1, 11)
         local x0 = math.max(1, math.min(mapW - #name + 1, cx - math.floor(#name / 2)))
         local row = rows[cy]
@@ -594,12 +604,47 @@ local function drawPanel()
     local p = provinces[selected]
     line = p.name .. " " .. p.owner .. (p.cap and " *" or "")
   elseif line == "" then
-    line = "Arrows pan  M/A move  Space pause"
+    line = "Touch a province to select"
   end
+
   mon.setBackgroundColor(colors.gray)
   mon.setTextColor(colors.white)
+  mon.setCursorPos(1, H - 1)
+  mon.write(string.rep(" ", W))
   mon.setCursorPos(1, H)
   mon.write(string.rep(" ", W))
+
+  touchButtons = {}
+  local function button(index, label, fn)
+    local x1 = math.floor((index - 1) * W / 5) + 1
+    local x2 = math.floor(index * W / 5)
+    local width = x2 - x1 + 1
+    touchButtons[#touchButtons + 1] = { x1 = x1, x2 = x2, fn = fn }
+    put(x1, H - 1, string.rep(" ", width), colors.black, colors.lightGray)
+    label = label:sub(1, width)
+    put(x1 + math.floor((width - #label) / 2), H - 1, label, colors.black, colors.lightGray)
+  end
+  button(1, "-", function() return changeZoom(-1) end)
+  button(2, "+", function() return changeZoom(1) end)
+  button(3, "CENTER", function()
+    local vw, vh = viewSize()
+    if selected then
+      vx = provinces[selected].cx - vw / 2
+      vy = provinces[selected].cy - vh / 2
+    else
+      vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
+    end
+    clampView()
+    return true
+  end)
+  button(4, paused and "PLAY" or "PAUSE", function()
+    paused = not paused
+    timerId = nil
+    restartTimer()
+    return false
+  end)
+  button(5, "MENU", function() enterMenu(); return false end)
+
   mon.setCursorPos(1, H)
   mon.write(line:sub(1, W))
 end
@@ -615,7 +660,20 @@ end
 
 ------------------------------------------------------------ ввод
 local function onTouch(x, y)
-  if x >= 1 and x <= mapW and y >= 2 and y <= H - 1 then
+  if y == H - 1 then
+    for _, button in ipairs(touchButtons) do
+      if x >= button.x1 and x <= button.x2 then
+        local redraw = button.fn()
+        if inMenu then return end
+        if redraw then drawMap() end
+        drawTopBar()
+        drawPanel()
+        return
+      end
+    end
+    return
+  end
+  if x >= 1 and x <= mapW and y >= 2 and y <= H - 2 then
     local p = pAt(x, y - 1)
     if mode and selected then
       local m = mode
