@@ -10,6 +10,19 @@ local provinces = map.provinces
 local mon = term.current()
 mon.setCursorBlink(false)
 
+local originalPalette = {}
+for name, hex in pairs(map.palette) do
+  local colour = colors[name]
+  local r, g, b = mon.getPaletteColour(colour)
+  originalPalette[colour] = { r, g, b }
+  mon.setPaletteColour(colour, hex)
+end
+local function restorePalette()
+  for colour, rgb in pairs(originalPalette) do
+    mon.setPaletteColour(colour, rgb[1], rgb[2], rgb[3])
+  end
+end
+
 local cmap = {}   -- id страны -> { name, color, fg }
 local countryIds = {}
 for _, c in ipairs(map.countries) do
@@ -890,6 +903,7 @@ local function run()
 end
 
 local ok, err = pcall(run)
+restorePalette()
 mon.setBackgroundColor(colors.black)
 mon.clear()
 mon.setCursorPos(1, 1)
