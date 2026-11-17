@@ -1,25 +1,24 @@
--- main_v2.lua: портативная версия для Pocket Computer в CC:Tweaked
--- Карта берётся из map.lua (генерируется gen_map.py). Рядом должен лежать map.lua.
--- Управление: касание экрана и клавиши компьютера.
+-- pocket.lua: HOI-CC для карманного компьютера (Advanced Pocket Computer, 26x20)
+-- Берёт карту из map.lua (та же, что в main.lua). Запуск: pocket
+-- Управление мышью: перетаскивание = двигать карту, нажатие = выбрать провинцию,
+-- колесо = масштаб. Клавиши: стрелки, = и - (масштаб), пробел (пауза), [ ] (скорость),
+-- R (нанять), I (инфо), C (центр на провинции), M или Q (меню).
 
 local dir = fs.getDir(shell.getRunningProgram())
 local map = dofile(fs.combine(dir, "map.lua"))
 local provinces = map.provinces
 
------------------------------------------------------------- экран Pocket Computer
-local mon = term.current()
-mon.setCursorBlink(false)
+if not term.isColor() then error("Нужен Advanced Pocket Computer (цветной экран)", 0) end
+local mon = term          -- общий код рисует через mon
 
-local originalPalette = {}
+-- своя палитра для красивой карты
 for name, hex in pairs(map.palette) do
-  local colour = colors[name]
-  local r, g, b = mon.getPaletteColour(colour)
-  originalPalette[colour] = { r, g, b }
-  mon.setPaletteColour(colour, hex)
+  term.setPaletteColour(colors[name], hex)
 end
 local function restorePalette()
-  for colour, rgb in pairs(originalPalette) do
-    mon.setPaletteColour(colour, rgb[1], rgb[2], rgb[3])
+  for name in pairs(map.palette) do
+    local r, g, b = term.nativePaletteColour(colors[name])
+    term.setPaletteColour(colors[name], r, g, b)
   end
 end
 
@@ -31,30 +30,45 @@ for _, c in ipairs(map.countries) do
 end
 local SEA_DEEP, SEA_SHALLOW = colors[map.seaDeep], colors[map.seaShallow]
 
+local neutralId
+local colorChoices = {}                -- цвета палитры, доступные для своей страны
+do
+  local seen = {}
+  for _, c in ipairs(map.countries) do
+    if c.neutral then neutralId = c.id end
+    if not c.neutral and not seen[c.color] then
+      seen[c.color] = true
+      colorChoices[#colorChoices + 1] = { color = colors[c.color], fg = colors[c.fg], slot = c.color }
+    end
+  end
+end
+
+local PANEL_W = 0
 local W, H, mapW, mapH
 
 ------------------------------------------------------------ мир
 local WW, WH = map.w, map.h
-local world = {}            -- packed byte rows: stored id is the world id plus one
+local world = {}            -- world[y][x]: >0 провинция, 0 глубокое море, -1 мелководье
 local ZOOMS = { 0.25, 0.5, 1, 2, 3, 4 }
 local zi = 2
 local vx, vy = 0, 0         -- левый верхний угол вида в клетках мира
 
 local function loadWorld()
   for y = 1, WH do
-    local chunks = {}
+    local row, x = {}, 1
     for id, n in map.rows[y]:gmatch("(-?%d+):(%d+)") do
       id, n = tonumber(id), tonumber(n)
-      chunks[#chunks + 1] = string.rep(string.char(id + 1), n)
+      for i = x, x + n - 1 do row[i] = id end
+      x = x + n
     end
-    world[y] = table.concat(chunks)
+    world[y] = row
   end
 end
 
 local function layout()
-  W, H = mon.getSize()
-  mapW = W
-  mapH = math.max(1, H - 4)
+  W, H = term.getSize()
+  mapW = W - PANEL_W
+  mapH = H - 4        -- строки: 1 шапка, карта, 3 нижних строки
 end
 
 local function viewSize()
@@ -74,8 +88,7 @@ local function rawAt(sx, sy)
   local wx = math.floor(vx + (sx - 1) / z) + 1
   local wy = math.floor(vy + (sy - 1) / z) + 1
   if wx < 1 or wx > WW or wy < 1 or wy > WH then return 0 end
-  local value = string.byte(world[wy], wx)
-  return value and value - 1 or 0
+  return world[wy][wx]
 end
 
 -- провинция под клеткой экрана, 0 = море
@@ -91,22 +104,44 @@ local speed = 2
 local SPEEDS = { 1.0, 0.5, 0.2, 0.05 }
 local date = { y = 1936, m = 1, d = 1 }
 local timerId = nil
-local touchButtons = {}
+local buttons = {}
 
 ------------------------------------------------------------ игровая логика (без отрисовки)
-local MOVE_DAYS = 3
 local playable = {}                  -- страны, за которые можно играть (без нейтральной)
 for _, id in ipairs(countryIds) do
   if not cmap[id].neutral then playable[#playable + 1] = id end
 end
-local settings = { country = 1, observer = false, speed = 2, aggr = 3 }
-local WAR_CHANCE = { 0, 0.05, 0.15, 0.4 }
-local AGGR_NAMES = { "Off", "Low", "Normal", "High" }
+local OPTS = {
+  { key = "aggr",   label = "AI wars",             vals = { "Off", "Low", "Normal", "High" },    num = { 0, 0.05, 0.15, 0.4 } },
+  { key = "expand", label = "AI colonization",     vals = { "Off", "Normal", "Fast" },           num = { 0, 1, 2 } },
+  { key = "start",  label = "Divisions at start",  vals = { "1 per province", "2 per province", "3 per province" }, num = { 1, 2, 3 } },
+  { key = "income", label = "Income",              vals = { "x0.5", "x1", "x2", "x4" },          num = { 0.5, 1, 2, 4 } },
+  { key = "cost",   label = "Division cost (PP)",  vals = { "50", "100", "150", "200" },         num = { 50, 100, 150, 200 } },
+  { key = "march",  label = "Days per land step",  vals = { "2", "3", "4", "6" },                num = { 2, 3, 4, 6 } },
+  { key = "events", label = "Random events",       vals = { "Off", "Rare", "Often", "Chaos" },   num = { 0, 0.02, 0.06, 0.2 } },
+  { key = "auto",   label = "Auto-recruit (you)",  vals = { "Off", "On" },                       num = { 0, 1 } },
+  { key = "speed",  label = "Start speed",         vals = { "1 (slow)", "2", "3", "4 (fast)" },  num = { 1, 2, 3, 4 } },
+}
+local settings = { country = 1, observer = false, aggr = 3, expand = 2, start = 1, income = 2,
+                   cost = 2, march = 2, events = 2, auto = 1, speed = 2 }
+local function val(key)
+  for _, o in ipairs(OPTS) do
+    if o.key == key then return o.num[settings[key]] end
+  end
+end
 local initialOwner = {}
 for i, p in ipairs(provinces) do initialOwner[i] = p.owner end
 local player = playable[1]               -- nil = режим наблюдателя
 local inMenu, gameStarted, quit = true, false, false
 local enterMenu                          -- определена ниже
+local menuPage = "main"
+local picking, pickSave = false, nil
+local draft = { name = "Newland", color = 1, cap = nil, size = 2 }
+local createMsg = ""
+local baseCap, capOf = {}, {}            -- исходные столицы / столицы своих стран
+for i, p in ipairs(provinces) do baseCap[i] = p.cap and true or false end
+local provByName = {}
+for i, p in ipairs(provinces) do provByName[p.name] = i end
 local divisions, nextDiv = {}, 1
 local wars = {}
 local battles = {}          -- провинции с боем в текущий день
@@ -114,7 +149,6 @@ local dirty = false         -- нужно ли перерисовать карт
 local mode = nil            -- режим приказа: { all = true/false }
 local msgText = ""
 local logLines = {}
-local helpOpen = false
 
 math.randomseed(os.epoch("utc"))
 
@@ -135,25 +169,102 @@ local function addLog(text)
   if #logLines > 8 then table.remove(logLines) end
 end
 
+local function addDivision(owner, prov)
+  divisions[#divisions + 1] = { id = nextDiv, owner = owner, prov = prov, str = 100 }
+  nextDiv = nextDiv + 1
+end
+
 local function spawnDivisions()
+  local n0 = val("start")
   for i, p in ipairs(provinces) do
-    for _ = 1, (cmap[p.owner].neutral and 0 or (p.cap and 3 or 1)) do
-      divisions[#divisions + 1] = { id = nextDiv, owner = p.owner, prov = i, str = 100 }
-      nextDiv = nextDiv + 1
+    if not cmap[p.owner].neutral then
+      for _ = 1, (p.cap and n0 + 2 or n0) do addDivision(p.owner, i) end
     end
   end
 end
 
-local function isNeighbor(a, b)
-  for _, n in ipairs(provinces[a].nb) do
-    if n == b then return true end
+local links = {}          -- links[i] = { { n = провинция, sea = true/false, days = дни по морю } }
+
+local function linkDays(a, b)
+  for _, l in ipairs(links[a] or {}) do
+    if l.n == b then return l.sea and l.days or val("march") end
   end
-  return false
+  return nil
+end
+
+-- сухопутные связи + морские пути между материками и островами
+local function buildLinks()
+  links = {}
+  local comp, ncomp = {}, 0
+  for i = 1, #provinces do
+    links[i] = {}
+    for _, n in ipairs(provinces[i].nb) do links[i][#links[i] + 1] = { n = n } end
+  end
+  for i = 1, #provinces do
+    if not comp[i] then
+      ncomp = ncomp + 1
+      comp[i] = ncomp
+      local queue, qi = { i }, 1
+      while qi <= #queue do
+        local a = queue[qi]
+        qi = qi + 1
+        for _, n in ipairs(provinces[a].nb) do
+          if not comp[n] then comp[n] = ncomp; queue[#queue + 1] = n end
+        end
+      end
+    end
+  end
+
+  local coastal = {}
+  for i, p in ipairs(provinces) do
+    if p.coast then coastal[#coastal + 1] = i end
+  end
+  local cross = {}        -- "a|b" -> пары прибрежных провинций разных суш
+  for x = 1, #coastal do
+    for y = x + 1, #coastal do
+      local i, j = coastal[x], coastal[y]
+      if comp[i] ~= comp[j] then
+        local dx = provinces[i].cx - provinces[j].cx
+        local dy = (provinces[i].cy - provinces[j].cy) * 1.5
+        local ca, cb = math.min(comp[i], comp[j]), math.max(comp[i], comp[j])
+        local key = ca .. "|" .. cb
+        cross[key] = cross[key] or {}
+        table.insert(cross[key], { d = math.sqrt(dx * dx + dy * dy), i = i, j = j })
+      end
+    end
+  end
+
+  local partners, use = {}, {}
+  for key, l in pairs(cross) do
+    table.sort(l, function(u, v) return u.d < v.d end)
+    local a, b = key:match("(%d+)|(%d+)")
+    a, b = tonumber(a), tonumber(b)
+    partners[a] = partners[a] or {}
+    partners[b] = partners[b] or {}
+    table.insert(partners[a], { key = key, d = l[1].d })
+    table.insert(partners[b], { key = key, d = l[1].d })
+    if l[1].d <= 60 then use[key] = true end          -- близкие берега всегда связаны
+  end
+  for _, list in pairs(partners) do                   -- каждая суша связана с двумя ближайшими
+    table.sort(list, function(u, v) return u.d < v.d end)
+    for k = 1, math.min(2, #list) do use[list[k].key] = true end
+  end
+  for key in pairs(use) do
+    local l, n = cross[key], 0
+    for _, e in ipairs(l) do
+      if n >= 4 or e.d > l[1].d + 12 then break end
+      local days = math.max(5, math.floor(e.d / 6 + 0.5))
+      table.insert(links[e.i], { n = e.j, sea = true, days = days })
+      table.insert(links[e.j], { n = e.i, sea = true, days = days })
+      n = n + 1
+    end
+  end
 end
 
 -- приказ любой страны: идти из from в to. Возвращает число отправленных дивизий (или 0, причина)
 local function moveDivisions(who, from, to, all)
-  if not isNeighbor(from, to) then return 0, "Not adjacent" end
+  local days = linkDays(from, to)
+  if not days then return 0, "No route there" end
   local t = provinces[to].owner
   if t ~= who and not cmap[t].neutral and not atWar(who, t) then
     return 0, "Declare war first"
@@ -161,7 +272,7 @@ local function moveDivisions(who, from, to, all)
   local moved = 0
   for _, d in ipairs(divisions) do
     if d.owner == who and d.prov == from and not d.to and (all or moved < 1) then
-      d.to, d.left = to, MOVE_DAYS
+      d.to, d.left = to, days
       moved = moved + 1
     end
   end
@@ -190,7 +301,7 @@ local function declareWar()
 end
 
 ------------------------------------------------------------ экономика и ИИ
-local DIV_COST, DIV_CAP = 100, 40       -- цена дивизии в очках производства, лимит дивизий
+local DIV_CAP = 40                      -- лимит дивизий на страну
 local pp, dead, lastWar = {}, {}, {}
 for _, id in ipairs(countryIds) do pp[id] = 0; lastWar[id] = -999 end
 local dayCount, aiIdx = 0, 0
@@ -233,7 +344,8 @@ local function aiTick(id)
   for from, list in pairs(idle) do
     if orders >= 3 then break end
     local bestTo, bestFoe
-    for _, n in ipairs(provinces[from].nb) do
+    for _, l in ipairs(links[from]) do
+      local n = l.n
       local o = provinces[n].owner
       if o ~= id and not cmap[o].neutral and atWar(id, o) and not targeted[n] then
         local f = foes[n] or 0
@@ -249,15 +361,17 @@ local function aiTick(id)
     end
   end
 
-  -- 2) колонизация: занимаем нейтральные земли по соседству
+  -- 2) колонизация: занимаем нейтральные земли рядом и за морем
+  local colOrders = 0
   for from, list in pairs(idle) do
-    if orders >= 3 then break end
+    if colOrders >= 3 * val("expand") then break end
     if #list >= 2 or not provinces[from].cap then
-      for _, n in ipairs(provinces[from].nb) do
+      for _, l in ipairs(links[from]) do
+        local n = l.n
         if cmap[provinces[n].owner].neutral and not targeted[n] then
           if moveDivisions(id, from, n, false) > 0 then
             targeted[n] = true
-            orders = orders + 1
+            colOrders = colOrders + 1
             dirty = true
           end
           break
@@ -268,13 +382,14 @@ local function aiTick(id)
 
   -- 3) объявление войны более слабому соседу
   if not inWar(id) and dayCount - lastWar[id] > 60
-      and WAR_CHANCE[settings.aggr] > 0 and math.random() < WAR_CHANCE[settings.aggr] then
+      and val("aggr") > 0 and math.random() < val("aggr") then
     local cnt = {}
     for _, d in ipairs(divisions) do cnt[d.owner] = (cnt[d.owner] or 0) + 1 end
     local cand, candCnt
-    for _, p in ipairs(provinces) do
+    for i, p in ipairs(provinces) do
       if p.owner == id then
-        for _, n in ipairs(p.nb) do
+        for _, l in ipairs(links[i]) do
+          local n = l.n
           local o = provinces[n].owner
           if o ~= id and not cmap[o].neutral and not dead[o] then
             local oc = cnt[o] or 0
@@ -291,11 +406,75 @@ local function aiTick(id)
   end
 end
 
+local function randomEvent()
+  local alive = {}
+  for _, id in ipairs(playable) do
+    if not dead[id] then alive[#alive + 1] = id end
+  end
+  if #alive == 0 then return end
+  local id = alive[math.random(#alive)]
+  local name = cmap[id].name
+  local k = math.random(6)
+  if k == 1 then
+    pp[id] = pp[id] + 60
+    addLog(name .. ": gold rush +60 PP")
+  elseif k == 2 then
+    pp[id] = pp[id] + 30
+    addLog(name .. ": good harvest +30 PP")
+  elseif k == 3 then
+    local at = capitalOf(id)
+    if at then
+      addDivision(id, at)
+      addLog(name .. ": volunteers join")
+      dirty = true
+    end
+  elseif k == 4 then
+    local mine = {}
+    for i, d in ipairs(divisions) do
+      if d.owner == id then mine[#mine + 1] = i end
+    end
+    if #mine >= 3 then
+      table.remove(divisions, mine[math.random(#mine)])
+      addLog(name .. ": mutiny, a division is lost")
+      dirty = true
+    end
+  elseif k == 5 then
+    local owned = {}
+    for i, p in ipairs(provinces) do
+      if p.owner == id then owned[#owned + 1] = i end
+    end
+    if #owned > 0 then
+      local at = owned[math.random(#owned)]
+      for _, d in ipairs(divisions) do
+        if d.owner == id and d.prov == at then d.str = d.str - 25 end
+      end
+      addLog("Plague in " .. provinces[at].name)
+    end
+  else
+    local owned = {}
+    for i, p in ipairs(provinces) do
+      if p.owner == id and not p.cap then owned[#owned + 1] = i end
+    end
+    if #owned >= 3 then
+      local at = owned[math.random(#owned)]
+      local occupied = false
+      for _, d in ipairs(divisions) do
+        if d.prov == at then occupied = true; break end
+      end
+      if not occupied then
+        provinces[at].owner = neutralId
+        addLog("Revolt in " .. provinces[at].name)
+        dirty = true
+      end
+    end
+  end
+end
+
 local function economyAndAI()
   dayCount = dayCount + 1
   local income, nprov, cnt = {}, {}, {}
   for _, p in ipairs(provinces) do
-    income[p.owner] = (income[p.owner] or 0) + 0.5 + 0.5 * p.ind
+    income[p.owner] = (income[p.owner] or 0) + (0.5 + 0.5 * p.ind) * val("income")
     nprov[p.owner] = (nprov[p.owner] or 0) + 1
   end
   for _, d in ipairs(divisions) do cnt[d.owner] = (cnt[d.owner] or 0) + 1 end
@@ -317,18 +496,22 @@ local function economyAndAI()
         dirty = true
       else
         pp[id] = pp[id] + (income[id] or 0)
-        if pp[id] >= DIV_COST and (cnt[id] or 0) < DIV_CAP then
+        local auto = (id ~= player) or val("auto") == 1
+        if auto and pp[id] >= val("cost") and (cnt[id] or 0) < DIV_CAP then
           local at = capitalOf(id)
           if at then
-            pp[id] = pp[id] - DIV_COST
-            divisions[#divisions + 1] = { id = nextDiv, owner = id, prov = at, str = 100 }
-            nextDiv = nextDiv + 1
+            pp[id] = pp[id] - val("cost")
+            addDivision(id, at)
             dirty = true
           end
         end
       end
     end
   end
+
+  -- случайные события
+  local ec = val("events")
+  if ec > 0 and math.random() < ec then randomEvent() end
 
   -- ИИ: две страны за день по кругу (кроме страны игрока)
   for _ = 1, 2 do
@@ -338,31 +521,46 @@ local function economyAndAI()
   end
 end
 
+local function recruit()
+  if not player then msgText = "Observer mode"; return end
+  local at = (selected and provinces[selected].owner == player) and selected or capitalOf(player)
+  if not at then msgText = "No province to recruit in"; return end
+  local cost = val("cost")
+  if pp[player] < cost then
+    msgText = string.format("Need %d PP (have %d)", cost, math.floor(pp[player]))
+    return
+  end
+  local n = 0
+  for _, d in ipairs(divisions) do
+    if d.owner == player then n = n + 1 end
+  end
+  if n >= DIV_CAP then msgText = "Division limit reached"; return end
+  pp[player] = pp[player] - cost
+  addDivision(player, at)
+  dirty = true
+  msgText = "Recruited in " .. provinces[at].name
+end
+
 local function newGame()
-  for i, p in ipairs(provinces) do p.owner = initialOwner[i] end
+  for i, p in ipairs(provinces) do
+    p.owner = initialOwner[i]
+    p.cap = baseCap[i] or capOf[i] or false
+  end
   divisions, nextDiv = {}, 1
   wars, battles = {}, {}
-  dirty, mode, msgText, logLines = false, nil, "", {}
+  dirty, mode, msgText, logLines = false, nil, "Tap a province to start", {}
   for _, id in ipairs(countryIds) do pp[id] = 0; lastWar[id] = -999; dead[id] = nil end
   dayCount, aiIdx = 0, 0
   date.y, date.m, date.d = 1936, 1, 1
   selected = nil
-  speed = settings.speed
+  speed = val("speed")
   paused = true
   timerId = nil
   player = (not settings.observer) and playable[settings.country] or nil
   spawnDivisions()
   zi = 2
   local vw, vh = viewSize()
-  selected = player and capitalOf(player) or nil
-  if selected then
-    local p = provinces[selected]
-    vx, vy = p.cx - vw / 2, p.cy - vh / 2
-    msgText = "Start: " .. p.name .. " " .. player
-  else
-    vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
-  end
-  clampView()
+  vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
 end
 
 local function advanceDay()
@@ -490,14 +688,35 @@ local function drawMap()
     rows[y] = { ch = ch, fg = fg, bg = bg }
   end
 
+  -- морские пути выбранной провинции (пунктир)
+  if selected and links[selected] then
+    local function sp(p)
+      return math.floor((p.cx - 0.5 - vx) * z) + 1, math.floor((p.cy - 0.5 - vy) * z) + 1
+    end
+    local x1, y1 = sp(provinces[selected])
+    for _, l in ipairs(links[selected]) do
+      if l.sea then
+        local x2, y2 = sp(provinces[l.n])
+        local steps = math.max(math.abs(x2 - x1), math.abs(y2 - y1))
+        for st = 0, steps do
+          if st % 3 == 0 then
+            local t = steps == 0 and 0 or st / steps
+            local x = math.floor(x1 + (x2 - x1) * t + 0.5)
+            local y = math.floor(y1 + (y2 - y1) * t + 0.5)
+            if x >= 1 and x <= mapW and y >= 1 and y <= mapH then rows[y].bg[x] = colors.white end
+          end
+        end
+      end
+    end
+  end
+
   -- подписи: ниже x2 только столицы
   for i, p in ipairs(provinces) do
     if z >= 2 or p.cap then
       local cx = math.floor((p.cx - 0.5 - vx) * z) + 1
       local cy = math.floor((p.cy - 0.5 - vy) * z) + 1
       if cx >= 1 and cx <= mapW and cy >= 1 and cy <= mapH then
-        local mark = (i == selected and p.owner == player) and ">" or (p.cap and "*" or "")
-        local name = mark .. p.name
+        local name = (p.cap and "*" or "") .. p.name
         name = name:sub(1, 11)
         local x0 = math.max(1, math.min(mapW - #name + 1, cx - math.floor(#name / 2)))
         local row = rows[cy]
@@ -562,40 +781,180 @@ local function drawMap()
     mon.setCursorPos(1, y + 1)
     mon.blit(table.concat(t), table.concat(f), table.concat(b))
   end
-  dirty = false
 end
 
------------------------------------------------------------- интерфейс
-local function put(x, y, text, fg, bg)
-  if y < 1 or y > H or x > W then return end
-  text = tostring(text)
-  if x < 1 then
-    text = text:sub(2 - x)
-    x = 1
+------------------------------------------------------------ свои страны
+local CUSTOM_FILE = fs.combine(dir, "custom.dat")
+local custom = {}   -- { { id, name, color, cap, provs = { имена провинций } } }
+
+local function saveCustom()
+  local h = fs.open(CUSTOM_FILE, "w")
+  if h then
+    h.write(textutils.serialize(custom))
+    h.close()
   end
-  text = text:sub(1, W - x + 1)
-  mon.setCursorPos(x, y)
-  mon.setTextColor(fg or colors.white)
-  mon.setBackgroundColor(bg or colors.black)
-  mon.write(text)
 end
 
-local function drawTopBar()
-  mon.setBackgroundColor(colors.gray)
-  mon.setTextColor(colors.white)
-  mon.setCursorPos(1, 1)
-  mon.write(string.rep(" ", W))
-  local tag = player or "OBS"
-  local s = string.format("%s %02d.%02d.%04d %s %d/%d x%s",
-    tag, date.d, date.m, date.y, paused and "PAUSE" or "RUN",
-    speed, #SPEEDS, tostring(ZOOMS[zi]))
-  mon.setCursorPos(1, 1)
-  mon.write(s:sub(1, W))
+local function addCustomCountry(cc)
+  local ch = colorChoices[cc.color] or colorChoices[1]
+  cmap[cc.id] = { name = cc.name, color = ch.color, fg = ch.fg }
+  countryIds[#countryIds + 1] = cc.id
+  playable[#playable + 1] = cc.id
+  pp[cc.id], lastWar[cc.id] = 0, -999
+  dead[cc.id] = true          -- в идущей партии её нет, появится в новой
+  for _, pname in ipairs(cc.provs) do
+    local idx = provByName[pname]
+    if idx and cmap[initialOwner[idx]].neutral then initialOwner[idx] = cc.id end
+  end
+  local cap = provByName[cc.cap]
+  if cap then capOf[cap] = true end
 end
 
-local function panStep()
-  local vw, vh = viewSize()
-  return math.max(3, math.floor(vw / 4)), math.max(3, math.floor(vh / 4))
+local function loadCustom()
+  if not fs.exists(CUSTOM_FILE) then return end
+  local h = fs.open(CUSTOM_FILE, "r")
+  if not h then return end
+  local t = textutils.unserialize(h.readAll())
+  h.close()
+  if type(t) ~= "table" then return end
+  for _, cc in ipairs(t) do
+    if type(cc) == "table" and cc.id and cc.name and cc.cap and cc.provs then
+      custom[#custom + 1] = cc
+      addCustomCountry(cc)
+    end
+  end
+end
+
+local function removeLastCustom()
+  local cc = table.remove(custom)
+  if not cc then return "Nothing to delete" end
+  for i = #countryIds, 1, -1 do
+    if countryIds[i] == cc.id then table.remove(countryIds, i) end
+  end
+  for i = #playable, 1, -1 do
+    if playable[i] == cc.id then table.remove(playable, i) end
+  end
+  for _, pname in ipairs(cc.provs) do
+    local idx = provByName[pname]
+    if idx and initialOwner[idx] == cc.id then initialOwner[idx] = neutralId end
+    if idx then capOf[idx] = nil end
+  end
+  for _, p in ipairs(provinces) do
+    if p.owner == cc.id then p.owner = neutralId end
+  end
+  local keep = {}
+  for _, d in ipairs(divisions) do
+    if d.owner ~= cc.id then keep[#keep + 1] = d end
+  end
+  divisions = keep
+  if player == cc.id then player = nil end
+  cmap[cc.id] = nil
+  pp[cc.id], dead[cc.id] = nil, nil
+  settings.country = math.max(1, math.min(settings.country, #playable))
+  saveCustom()
+  return "Deleted " .. cc.name
+end
+
+local function createCountry()
+  if not draft.cap then return "Pick a capital on the map first" end
+  if #custom >= 8 then return "Limit: 8 custom countries" end
+  if not cmap[initialOwner[draft.cap]].neutral then return "That province is taken" end
+  local picked, queue, seen, qi = { draft.cap }, { draft.cap }, { [draft.cap] = true }, 1
+  while qi <= #queue and #picked < draft.size do
+    local a = queue[qi]
+    qi = qi + 1
+    for _, n in ipairs(provinces[a].nb) do
+      if not seen[n] and cmap[initialOwner[n]].neutral and #picked < draft.size then
+        seen[n] = true
+        picked[#picked + 1] = n
+        queue[#queue + 1] = n
+      end
+    end
+  end
+  local k = 1
+  while cmap["C" .. k] do k = k + 1 end
+  local names = {}
+  for _, idx in ipairs(picked) do names[#names + 1] = provinces[idx].name end
+  local cc = { id = "C" .. k, name = draft.name, color = draft.color, cap = provinces[draft.cap].name, provs = names }
+  custom[#custom + 1] = cc
+  addCustomCountry(cc)
+  saveCustom()
+  draft.cap = nil
+  return cc.name .. " created! Start a NEW GAME to play"
+end
+
+local SYL_A = { "al", "bel", "cor", "dra", "el", "fen", "gal", "hor", "ist", "kar", "lor", "mar",
+                "nor", "ost", "pra", "ran", "sol", "tor", "ul", "val", "wen", "yor", "zan" }
+local SYL_B = { "a", "o", "i", "e", "u", "an", "en", "or", "is" }
+local SYL_C = { "ia", "land", "mark", "ria", "stan", "onia", "ova", "burg", "grad", "ara" }
+local function randomName()
+  local n = SYL_A[math.random(#SYL_A)] .. (math.random() < 0.5 and SYL_B[math.random(#SYL_B)] or "")
+    .. SYL_C[math.random(#SYL_C)]
+  return (n:sub(1, 1):upper() .. n:sub(2)):sub(1, 12)
+end
+
+-- ввод имени с клавиатуры компьютера (монитор ввода текста не поддерживает)
+local function askName()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("New country name (letters, digits, up to 12 characters).")
+  print("Empty line keeps: " .. draft.name)
+  write("> ")
+  local text = read() or ""
+  text = text:gsub("[^%w %-%.]", "")
+  text = text:match("^%s*(.-)%s*$"):sub(1, 12)
+  if text ~= "" then draft.name = text end
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("HOI-CC is running on the monitor.")
+end
+
+------------------------------------------------------------ интерфейс (карманный компьютер)
+local screen = "menu"     -- menu | settings | create | game | pick | info | countries | log
+local listOffset = 0
+local drag = nil          -- { x, y, moved } для перетаскивания карты
+
+local function put(x, y, text, fg, bg)
+  term.setCursorPos(x, y)
+  term.setTextColor(fg or colors.white)
+  term.setBackgroundColor(bg or colors.black)
+  term.write(text)
+end
+
+local function fill(x, y, w, h, bg)
+  for r = 0, h - 1 do put(x, y + r, string.rep(" ", w), colors.white, bg) end
+end
+
+local function clearScreen()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  buttons = {}
+end
+
+-- кнопка w x h клеток; fn вызывается при нажатии
+local function btn(label, x, y, w, h, col, fn, fg)
+  buttons[#buttons + 1] = { x1 = x, x2 = x + w - 1, y1 = y, y2 = y + h - 1, fn = fn }
+  fill(x, y, w, h, col)
+  label = label:sub(1, w)
+  put(x + math.floor((w - #label) / 2), y + math.floor(h / 2), label, fg or colors.black, col)
+end
+
+local function hit(x, y)
+  for _, bt in ipairs(buttons) do
+    if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
+      mode = nil
+      bt.fn()
+      return true
+    end
+  end
+  return false
+end
+
+local function setScreen(name)
+  screen = name
+  if name ~= "game" then paused = true; timerId = nil end
 end
 
 local function restartTimer()
@@ -609,164 +968,230 @@ local function changeZoom(dir)
   vw, vh = viewSize()
   vx, vy = cx - vw / 2, cy - vh / 2
   clampView()
-  return true
 end
 
-local centerView
-
-local function drawHelp()
-  mon.setBackgroundColor(colors.black)
-  mon.clear()
-  put(1, 1, "HOW TO PLAY", colors.black, colors.lightBlue)
-  local lines = {
-    "Tap province = select it.",
-    "1 DIV / ALL: choose army,",
-    "then tap a neighboring province.",
-    "WAR: select enemy land, tap WAR.",
-    "ZOOM - / +: change map scale.",
-    "CENTER: center on selected province.",
-    "PLAY / PAUSE: control time.",
-    "MENU: return to menu.",
-    "Keyboard: arrows pan the map.",
-    "PageUp/Down: zoom; R: center.",
-    "M/A: move 1/all; W: declare war.",
-    "Space: pause; Backspace: cancel.",
-    "Esc: menu; Q: quit.",
-    "HELP/H: show this guide.",
-  }
-  for i, line in ipairs(lines) do
-    put(1, i + 2, line, colors.white)
-  end
-  put(1, H, "Tap anywhere or press a key", colors.lightGray)
+local function panBy(dx, dy)      -- в клетках экрана
+  local z = ZOOMS[zi]
+  vx, vy = vx + dx / z, vy + dy / z
+  clampView()
 end
 
-local function drawPanel()
-  local line = msgText
-  if line == "" and mode and selected then
-    line = mode.all and "Tap neighbor: all divisions" or "Tap neighbor: 1 division"
-  elseif line == "" and selected then
-    local p = provinces[selected]
-    line = p.name .. " " .. p.owner .. " | 1 DIV / ALL"
-  elseif line == "" then
-    line = "Tap province, then action"
+------------------------------------------------------------ экран игры
+local function drawTopBar(text)
+  fill(1, 1, W, 1, colors.gray)
+  local s = text or string.format("%02d.%02d.%04d %s x%d%s", date.d, date.m, date.y,
+    paused and "||" or ">>", speed, player and "" or " OBS")
+  put(1, 1, s:sub(1, W), colors.white, colors.gray)
+end
+
+local function drawInfoRow()
+  local y = H - 2
+  fill(1, y, W, 1, colors.black)
+  local text, fg = msgText, colors.white
+  if text == "" then
+    if selected then
+      local p = provinces[selected]
+      local mine, foe = 0, 0
+      for _, d in ipairs(divisions) do
+        if d.prov == selected then
+          if d.owner == player then mine = mine + 1 else foe = foe + 1 end
+        end
+      end
+      text = string.format("%s %s %d/%d", p.name, cmap[p.owner].name:sub(1, 8), mine, foe)
+    else
+      text, fg = "Drag=pan  tap=select", colors.lightGray
+    end
+  end
+  put(1, y, text:sub(1, W), fg)
+end
+
+local function drawBottom()
+  local x = 1
+  local y = H - 1
+  fill(1, y, W, 1, colors.black)
+  local function b(label, col, fn)
+    btn(label, x, y, #label, 1, col, fn)
+    x = x + #label
+  end
+  if player then
+    b("[MOVE]", (mode and mode.all) and colors.white or colors.lightGray, function()
+      if selected then mode = { all = true }; msgText = "Tap target province"
+      else msgText = "Select a province" end
+    end)
+    b("[M1]", (mode and not mode.all) and colors.white or colors.lightGray, function()
+      if selected then mode = { all = false }; msgText = "Tap target (1 div)"
+      else msgText = "Select a province" end
+    end)
+    b("[RCT]", colors.lightGray, function() recruit() end)
+    b("[WAR]", colors.lightGray, function() declareWar() end)
+    b("[INFO]", colors.lightGray, function() setScreen("info") end)
+  else
+    b("[INFO]", colors.lightGray, function() setScreen("info") end)
+    b("[CTRY]", colors.lightGray, function() listOffset = 0; setScreen("countries") end)
+    b("[LOG]", colors.lightGray, function() setScreen("log") end)
   end
 
-  mon.setBackgroundColor(colors.gray)
-  mon.setTextColor(colors.white)
-  for y = H - 2, H do
-    mon.setCursorPos(1, y)
-    mon.write(string.rep(" ", W))
-  end
-
-  touchButtons = {}
-  local function button(row, index, label, fn)
-    local x1 = math.floor((index - 1) * W / 5) + 1
-    local x2 = math.floor(index * W / 5)
-    if row == 1 and index >= 3 then x2 = math.min(W, x2 + 1) end
-    if row == 1 and index >= 4 then x1 = x1 + 1 end
-    local width = x2 - x1 + 1
-    local y = row == 1 and H - 2 or H - 1
-    touchButtons[#touchButtons + 1] = { x1 = x1, x2 = x2, y = y, fn = fn }
-    put(x1, y, string.rep(" ", width), colors.black, colors.lightGray)
-    label = label:sub(1, width)
-    put(x1 + math.floor((width - #label) / 2), y, label, colors.black, colors.lightGray)
-  end
-  button(1, 1, "ZOOM-", function() return changeZoom(-1) end)
-  button(1, 2, "ZOOM+", function() return changeZoom(1) end)
-  button(1, 3, "CENTER", function() centerView(); return true end)
-  button(1, 4, paused and "PLAY" or "PAUSE", function()
+  x, y = 1, H
+  fill(1, y, W, 1, colors.black)
+  b(paused and "[>>]" or "[||]", colors.lightGray, function()
     paused = not paused
     timerId = nil
     restartTimer()
-    return false
   end)
-  button(1, 5, "MENU", function() enterMenu(); return false end)
-  button(2, 1, "1 DIV", function()
-    if selected then mode = { all = false }; msgText = "Tap a neighbor"
-    else msgText = "Select a source first" end
-    return false
-  end)
-  button(2, 2, "ALL", function()
-    if selected then mode = { all = true }; msgText = "Tap a neighbor"
-    else msgText = "Select a source first" end
-    return false
-  end)
-  button(2, 3, "WAR", function() declareWar(); return true end)
-  button(2, 4, "HELP", function()
-    paused = true
-    timerId = nil
-    helpOpen = true
-    drawHelp()
-    return false
-  end)
-  button(2, 5, "CANCEL", function()
-    mode = nil
-    msgText = "Order cancelled"
-    return false
-  end)
-
-  mon.setTextColor(colors.white)
-  mon.setBackgroundColor(colors.gray)
-  mon.setCursorPos(1, H)
-  mon.write(line:sub(1, W))
+  b("[-]", colors.lightGray, function() speed = math.max(1, speed - 1); restartTimer() end)
+  b("[+]", colors.lightGray, function() speed = math.min(#SPEEDS, speed + 1); restartTimer() end)
+  b("[Z-]", colors.lightGray, function() changeZoom(-1) end)
+  b("[Z+]", colors.lightGray, function() changeZoom(1) end)
+  b("[MENU]", colors.lightGray, function() setScreen("menu") end)
 end
 
-local function redrawAll()
-  mon.setBackgroundColor(colors.black)
-  mon.clear()
+local function drawGame()
+  buttons = {}
   clampView()
   drawMap()
   drawTopBar()
-  drawPanel()
+  drawInfoRow()
+  drawBottom()
 end
 
------------------------------------------------------------- ввод
-local function onTouch(x, y)
-  if helpOpen then
-    helpOpen = false
-    redrawAll()
-    return
+------------------------------------------------------------ выбор столицы на карте
+local function startPick()
+  pickSave = { owners = {}, divisions = divisions, player = player, selected = selected }
+  for i, p in ipairs(provinces) do
+    pickSave.owners[i] = p.owner
+    p.owner = initialOwner[i]
   end
-  for _, button in ipairs(touchButtons) do
-    if y == button.y and x >= button.x1 and x <= button.x2 then
-      local redraw = button.fn()
-      if inMenu then return end
-      if helpOpen then return end
-      if redraw then drawMap() end
-      drawTopBar()
-      drawPanel()
-      return
+  divisions = {}
+  player, selected = nil, nil
+  msgText = "Tap a free (beige) province"
+  setScreen("pick")
+end
+
+local function endPick(chosen)
+  for i, p in ipairs(provinces) do p.owner = pickSave.owners[i] end
+  divisions, player, selected = pickSave.divisions, pickSave.player, pickSave.selected
+  pickSave = nil
+  msgText = ""
+  if chosen then draft.cap = chosen end
+  setScreen("create")
+end
+
+local function drawPick()
+  buttons = {}
+  clampView()
+  drawMap()
+  drawTopBar(" PICK A CAPITAL")
+  drawInfoRow()
+  fill(1, H - 1, W, 2, colors.black)
+  btn("[CANCEL]", 1, H, 8, 1, colors.lightGray, function() endPick(nil) end)
+  btn("[Z-]", 10, H, 4, 1, colors.lightGray, function() changeZoom(-1) end)
+  btn("[Z+]", 14, H, 4, 1, colors.lightGray, function() changeZoom(1) end)
+end
+
+------------------------------------------------------------ экраны информации
+local function drawInfoScreen()
+  clearScreen()
+  drawTopBar(" INFO")
+  local y = 3
+  if player then
+    local pc = cmap[player]
+    local inc, n = 0, 0
+    for _, p in ipairs(provinces) do
+      if p.owner == player then inc = inc + (0.5 + 0.5 * p.ind) * val("income") end
     end
+    for _, d in ipairs(divisions) do
+      if d.owner == player then n = n + 1 end
+    end
+    put(1, y, (" " .. pc.name .. string.rep(" ", W)):sub(1, W), pc.fg, pc.color); y = y + 1
+    put(1, y, string.format("PP %d/%d  +%.1f/day", math.floor(pp[player]), val("cost"), inc)); y = y + 1
+    put(1, y, "Divisions: " .. n); y = y + 2
+  else
+    put(1, y, "Observer mode", colors.lightBlue); y = y + 2
   end
-  if x >= 1 and x <= mapW and y >= 2 and y <= H - 3 then
-    local p = pAt(x, y - 1)
-    if mode and selected then
-      local m = mode
-      mode = nil
-      if p ~= 0 and p ~= selected then
-        issueMove(selected, p, m.all)
-      else
-        msgText = "Cancelled"
+  put(1, y, "PROVINCE", colors.lightBlue); y = y + 1
+  if selected then
+    local p = provinces[selected]
+    local c = cmap[p.owner]
+    put(1, y, ((p.cap and "* " or "") .. p.name .. string.rep(" ", W)):sub(1, W), c.fg, c.color); y = y + 1
+    put(1, y, "Owner:  " .. c.name); y = y + 1
+    put(1, y, "Pop:    " .. p.pop .. "M   Ind: " .. p.ind); y = y + 1
+    local seaN = 0
+    for _, l in ipairs(links[selected] or {}) do
+      if l.sea then seaN = seaN + 1 end
+    end
+    put(1, y, "Borders: " .. #p.nb .. (seaN > 0 and (" +" .. seaN .. " sea") or "")); y = y + 1
+    local mine, foe = 0, 0
+    for _, d in ipairs(divisions) do
+      if d.prov == selected then
+        if d.owner == player then mine = mine + 1 else foe = foe + 1 end
       end
-    else
-      selected = (p ~= 0) and p or nil
-      msgText = ""
     end
-    drawMap()
-    drawTopBar()
-    drawPanel()
+    put(1, y, "Troops:  " .. mine .. " yours / " .. foe .. " other")
+  else
+    put(1, y, "(nothing selected)", colors.lightGray)
   end
+  btn("[CTRY]", 1, H, 6, 1, colors.lightGray, function() listOffset = 0; setScreen("countries") end)
+  btn("[LOG]", 8, H, 5, 1, colors.lightGray, function() setScreen("log") end)
+  btn("[BACK]", 14, H, 6, 1, colors.white, function() setScreen("game") end)
+end
+
+local function drawCountries()
+  clearScreen()
+  drawTopBar(" COUNTRIES (tap = play as)")
+  local counts = {}
+  for _, p in ipairs(provinces) do counts[p.owner] = (counts[p.owner] or 0) + 1 end
+  local rows = H - 4
+  local maxOff = math.max(0, #countryIds - rows)
+  listOffset = math.max(0, math.min(listOffset, maxOff))
+  for r = 1, rows do
+    local id = countryIds[listOffset + r]
+    if not id then break end
+    local c = cmap[id]
+    local y = 2 + r
+    local tag = (id == player) and "YOU" or ((player and atWar(player, id)) and "WAR" or "")
+    put(1, y, "  ", colors.white, c.color)
+    put(4, y, string.format("%-9s %3dp %s", c.name:sub(1, 9), counts[id] or 0, tag),
+      id == player and colors.lightBlue or colors.white)
+    if not c.neutral then
+      buttons[#buttons + 1] = { x1 = 1, x2 = W, y1 = y, y2 = y, fn = function()
+        player = id
+        msgText = "Now playing " .. c.name
+      end }
+    end
+  end
+  btn("[^]", 1, H, 3, 1, colors.lightGray, function() listOffset = listOffset - 5 end)
+  btn("[v]", 5, H, 3, 1, colors.lightGray, function() listOffset = listOffset + 5 end)
+  btn("[BACK]", 14, H, 6, 1, colors.white, function() setScreen("game") end)
+end
+
+local function drawLogScreen()
+  clearScreen()
+  drawTopBar(" LOG")
+  if #logLines == 0 then put(1, 3, "(nothing happened yet)", colors.lightGray) end
+  for i, line in ipairs(logLines) do
+    put(1, 2 + i, line:sub(1, W), colors.lightGray)
+  end
+  btn("[BACK]", 14, H, 6, 1, colors.white, function() setScreen("game") end)
 end
 
 ------------------------------------------------------------ меню
-local menuRow = 1
-local MENU_COUNT = 7
+local function chipRow(y, text, col, fg)
+  fill(5, y, W - 8, 1, col)
+  put(5 + math.floor((W - 8 - #text) / 2), y, text:sub(1, W - 8), fg, col)
+end
 
-local function drawMenu()
-  mon.setBackgroundColor(colors.black)
-  mon.clear()
-  put(1, 1, "HOI-CC POCKET", colors.black, colors.lightBlue)
-  put(1, 2, "Up/Down select  Left/Right change", colors.lightGray)
+local function drawMenuScreen()
+  clearScreen()
+  fill(1, 1, W, 3, colors.white)
+  put(1 + math.floor((W - 11) / 2), 2, "H O I - C C", colors.black, colors.white)
+  put(1, 4, "Pocket edition", colors.lightGray)
+
+  put(1, 6, "MODE", colors.lightBlue)
+  local half = math.floor((W - 1) / 2)
+  btn("PLAY", 1, 7, half, 1, settings.observer and colors.lightGray or colors.white,
+    function() settings.observer = false end)
+  btn("WATCH", half + 2, 7, half, 1, settings.observer and colors.white or colors.lightGray,
+    function() settings.observer = true end)
 
   local id = playable[settings.country]
   local c = cmap[id]
@@ -774,200 +1199,230 @@ local function drawMenu()
   for i = 1, #provinces do
     if initialOwner[i] == id then n = n + 1 end
   end
-  local labels = {
-    settings.observer and "Mode: Observer" or "Mode: Play",
-    string.format("Country: %s (%d)", c.name, n),
-    string.format("Speed: %d/%d", settings.speed, #SPEEDS),
-    "AI wars: " .. AGGR_NAMES[settings.aggr],
-    gameStarted and "Start new game" or "Start game",
-    gameStarted and "Resume game" or "Resume (not started)",
-    "Quit",
-  }
-  for i, label in ipairs(labels) do
-    local y = i + 3
-    local bg = i == menuRow and colors.blue or colors.black
-    put(1, y, string.rep(" ", W), colors.white, bg)
-    put(1, y, (i == menuRow and "> " or "  ") .. label, colors.white, bg)
-  end
-  put(1, H, "Enter choose  Q quit", colors.lightGray, colors.black)
-end
+  put(1, 9, settings.observer and "COUNTRY (not used)" or "COUNTRY", colors.lightBlue)
+  btn("<", 1, 10, 3, 1, colors.lightGray, function()
+    settings.country = (settings.country - 2) % #playable + 1
+  end)
+  chipRow(10, string.format("%s (%dp)", c.name, n), c.color, c.fg)
+  btn(">", W - 2, 10, 3, 1, colors.lightGray, function()
+    settings.country = settings.country % #playable + 1
+  end)
 
-enterMenu = function()
-  inMenu = true
-  paused = true
-  timerId = nil
-  drawMenu()
-end
-
-local function menuAction(row, delta)
-  if row == 1 then
-    settings.observer = not settings.observer
-  elseif row == 2 then
-    settings.country = (settings.country - 1 + delta) % #playable + 1
-  elseif row == 3 then
-    settings.speed = math.max(1, math.min(#SPEEDS, settings.speed + delta))
-  elseif row == 4 then
-    settings.aggr = math.max(1, math.min(#AGGR_NAMES, settings.aggr + delta))
-  elseif row == 5 and delta == 0 then
+  btn(gameStarted and "NEW GAME" or "START GAME", 1, 12, W, 3, colors.white, function()
     newGame()
     gameStarted = true
-    inMenu = false
-    redrawAll()
-  elseif row == 6 and gameStarted and delta == 0 then
-    inMenu = false
-    redrawAll()
-  elseif row == 7 and delta == 0 then
-    quit = true
+    setScreen("game")
+  end)
+  btn("SETTINGS", 1, 16, half, 1, colors.lightGray, function() setScreen("settings") end)
+  btn("CREATE", half + 2, 16, half, 1, colors.lightGray, function()
+    createMsg = ""
+    setScreen("create")
+  end)
+  if gameStarted then
+    btn("RESUME", 1, 18, W, 1, colors.lightGray, function() setScreen("game") end)
   end
-  if inMenu and not quit then drawMenu() end
+  btn("QUIT", 1, 19, W, 1, colors.lightGray, function() quit = true end)
+  put(1, 20, "Enter=start  Q=quit", colors.lightGray)
 end
 
-local function onMenuKey(code)
-  if code == keys.up then
-    menuRow = (menuRow - 2) % MENU_COUNT + 1
-    drawMenu()
-  elseif code == keys.down then
-    menuRow = menuRow % MENU_COUNT + 1
-    drawMenu()
-  elseif code == keys.left then
-    menuAction(menuRow, -1)
-  elseif code == keys.right then
-    menuAction(menuRow, 1)
-  elseif code == keys.enter or code == keys.space then
-    if menuRow <= 4 then
-      menuAction(menuRow, menuRow == 2 and 1 or 0)
+local SHORT = { aggr = "AI wars", expand = "AI expand", start = "Start divs", income = "Income",
+                cost = "Div cost", march = "Days/step", events = "Events", auto = "AutoRecruit",
+                speed = "Start speed" }
+
+local function drawSettings()
+  clearScreen()
+  fill(1, 1, W, 1, colors.white)
+  put(1, 1, " SETTINGS", colors.black, colors.white)
+  for i, o in ipairs(OPTS) do
+    local y = 2 + i
+    put(1, y, (SHORT[o.key] or o.label):sub(1, 11), colors.white)
+    local text = o.vals[settings[o.key]]:sub(1, 10)
+    put(12, y, "<", colors.black, colors.lightGray)
+    put(13, y, string.rep(" ", 10), colors.white, colors.gray)
+    put(13 + math.floor((10 - #text) / 2), y, text, colors.white, colors.gray)
+    put(23, y, ">", colors.black, colors.lightGray)
+    buttons[#buttons + 1] = { x1 = 11, x2 = 13, y1 = y, y2 = y, fn = function()
+      settings[o.key] = (settings[o.key] - 2) % #o.vals + 1
+    end }
+    buttons[#buttons + 1] = { x1 = 14, x2 = W, y1 = y, y2 = y, fn = function()
+      settings[o.key] = settings[o.key] % #o.vals + 1
+    end }
+  end
+  put(1, 13, "Tap < or > to change.", colors.lightGray)
+  put(1, 14, "Applies to NEW GAME.", colors.lightGray)
+  btn("BACK", 1, H, W, 1, colors.white, function() setScreen("menu") end)
+end
+
+local function drawCreate()
+  clearScreen()
+  fill(1, 1, W, 1, colors.white)
+  put(1, 1, " CREATE COUNTRY", colors.black, colors.white)
+  local ch = colorChoices[draft.color]
+  fill(1, 3, W, 1, ch.color)
+  put(1 + math.floor((W - #draft.name) / 2), 3, draft.name, ch.fg, ch.color)
+  local half = math.floor((W - 1) / 2)
+  btn("RANDOM", 1, 4, half, 1, colors.lightGray, function() draft.name = randomName() end)
+  btn("TYPE", half + 2, 4, half, 1, colors.lightGray, function() askName() end)
+
+  put(1, 6, "COLOR", colors.lightBlue)
+  btn("<", 1, 7, 3, 1, colors.lightGray, function()
+    draft.color = (draft.color - 2) % #colorChoices + 1
+  end)
+  chipRow(7, string.format("color %d/%d", draft.color, #colorChoices), ch.color, ch.fg)
+  btn(">", W - 2, 7, 3, 1, colors.lightGray, function()
+    draft.color = draft.color % #colorChoices + 1
+  end)
+
+  put(1, 9, "SIZE (provinces)", colors.lightBlue)
+  btn("<", 1, 10, 3, 1, colors.lightGray, function() draft.size = math.max(1, draft.size - 1) end)
+  chipRow(10, tostring(draft.size), colors.gray, colors.white)
+  btn(">", W - 2, 10, 3, 1, colors.lightGray, function() draft.size = math.min(6, draft.size + 1) end)
+
+  put(1, 12, "CAPITAL", colors.lightBlue)
+  btn(draft.cap and provinces[draft.cap].name or "PICK ON MAP", 1, 13, W, 1, colors.lightGray,
+    function() startPick() end)
+
+  btn("CREATE", 1, 15, W, 3, colors.white, function() createMsg = createCountry() end)
+  put(1, 18, createMsg:sub(1, W), colors.white)
+  btn("DEL LAST", 1, H, half, 1, colors.lightGray, function() createMsg = removeLastCustom() end)
+  btn("BACK", half + 2, H, half, 1, colors.lightGray, function() setScreen("menu") end)
+end
+
+local function redrawScreen()
+  if screen == "game" then drawGame()
+  elseif screen == "pick" then drawPick()
+  elseif screen == "menu" then drawMenuScreen()
+  elseif screen == "settings" then drawSettings()
+  elseif screen == "create" then drawCreate()
+  elseif screen == "info" then drawInfoScreen()
+  elseif screen == "countries" then drawCountries()
+  elseif screen == "log" then drawLogScreen()
+  end
+end
+
+------------------------------------------------------------ ввод
+local function onMapTap(x, y)
+  local p = pAt(x, y - 1)
+  if screen == "pick" then
+    if p ~= 0 and cmap[provinces[p].owner].neutral then
+      endPick(p)
     else
-      menuAction(menuRow, 0)
+      msgText = "Pick a free (beige) province"
     end
-  elseif code == keys.q then
-    quit = true
-  end
-end
-
-local function onMenuTouch(x, y)
-  local row = y - 3
-  if x >= 1 and x <= W and row >= 1 and row <= MENU_COUNT then
-    menuRow = row
-    menuAction(row, (row == 2 or row == 3 or row == 4) and 1 or 0)
-  end
-end
-
-local function pan(dx, dy)
-  local sx, sy = panStep()
-  vx, vy = vx + dx * sx, vy + dy * sy
-  clampView()
-end
-
-centerView = function()
-  local vw, vh = viewSize()
-  if selected then
-    vx = provinces[selected].cx - vw / 2
-    vy = provinces[selected].cy - vh / 2
-  else
-    vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
-  end
-  clampView()
-end
-
-local function onGameKey(code)
-  if helpOpen then
-    helpOpen = false
-    redrawAll()
     return
   end
-  local mapChanged = false
-  if code == keys.q then
-    quit = true
-    return
-  elseif code == keys.escape then
-    enterMenu()
-    return
-  elseif code == keys.h then
-    paused = true
-    timerId = nil
-    helpOpen = true
-    drawHelp()
-    return
-  elseif code == keys.space then
-    paused = not paused
-    timerId = nil
-    restartTimer()
-  elseif code == keys.minus then
-    speed = math.max(1, speed - 1)
-    timerId = nil
-    restartTimer()
-  elseif code == keys.equals then
-    speed = math.min(#SPEEDS, speed + 1)
-    timerId = nil
-    restartTimer()
-  elseif code == keys.left then
-    pan(-1, 0); mapChanged = true
-  elseif code == keys.right then
-    pan(1, 0); mapChanged = true
-  elseif code == keys.up then
-    pan(0, -1); mapChanged = true
-  elseif code == keys.down then
-    pan(0, 1); mapChanged = true
-  elseif code == keys.pageUp then
-    mapChanged = changeZoom(1)
-  elseif code == keys.pageDown then
-    mapChanged = changeZoom(-1)
-  elseif code == keys.r then
-    centerView(); mapChanged = true
-  elseif code == keys.backspace then
+  if mode and selected then
+    local m = mode
     mode = nil
-    msgText = "Order cancelled"
-  elseif code == keys.m or code == keys.a then
-    if selected then
-      mode = { all = code == keys.a }
-      msgText = "Tap destination"
-    else
-      msgText = "Select a province first"
-    end
-  elseif code == keys.w then
-    declareWar()
-  elseif code == keys.c then
-    local index = 0
-    for i, id in ipairs(playable) do
-      if id == player then index = i; break end
-    end
-    index = index % #playable + 1
-    player = playable[index]
-    msgText = "Playing " .. player
+    if p ~= 0 and p ~= selected then issueMove(selected, p, m.all) else msgText = "Cancelled" end
+  else
+    selected = (p ~= 0) and p or nil
+    msgText = ""
   end
-  if mapChanged then drawMap() end
-  drawTopBar()
-  drawPanel()
+end
+
+local function inMapArea(x, y) return x >= 1 and x <= mapW and y >= 2 and y <= mapH + 1 end
+
+local function onKey(k)
+  if screen == "menu" then
+    if k == keys.q then quit = true
+    elseif k == keys.enter then
+      newGame()
+      gameStarted = true
+      setScreen("game")
+    end
+  elseif screen == "game" or screen == "pick" then
+    local st = 4
+    if k == keys.left then panBy(-st, 0)
+    elseif k == keys.right then panBy(st, 0)
+    elseif k == keys.up then panBy(0, -st)
+    elseif k == keys.down then panBy(0, st)
+    elseif k == keys.equals then changeZoom(1)
+    elseif k == keys.minus then changeZoom(-1)
+    elseif screen == "game" then
+      if k == keys.space then paused = not paused; timerId = nil; restartTimer()
+      elseif k == keys.leftBracket then speed = math.max(1, speed - 1); restartTimer()
+      elseif k == keys.rightBracket then speed = math.min(#SPEEDS, speed + 1); restartTimer()
+      elseif k == keys.r then recruit()
+      elseif k == keys.i then setScreen("info")
+      elseif k == keys.m or k == keys.q then setScreen("menu")
+      elseif k == keys.c and selected then
+        local vw, vh = viewSize()
+        vx, vy = provinces[selected].cx - vw / 2, provinces[selected].cy - vh / 2
+        clampView()
+      end
+    end
+  else
+    if k == keys.backspace or k == keys.q then
+      if screen == "settings" or screen == "create" then setScreen("menu") else setScreen("game") end
+    elseif screen == "countries" then
+      if k == keys.up then listOffset = listOffset - 1 elseif k == keys.down then listOffset = listOffset + 1 end
+    end
+  end
 end
 
 ------------------------------------------------------------ старт
 local function run()
   layout()
   loadWorld()
-  drawMenu()
+  buildLinks()
+  loadCustom()
+  redrawScreen()
 
   while not quit do
     local ev, a, b, c = os.pullEvent()
     if ev == "mouse_click" then
-      if inMenu then onMenuTouch(b, c) else onTouch(b, c) end
-    elseif ev == "timer" and a == timerId and not inMenu then
+      if a == 1 then
+        if (screen == "game" or screen == "pick") and inMapArea(b, c) then
+          drag = { x = b, y = c, moved = false }
+        elseif hit(b, c) then
+          if not quit then redrawScreen() end
+        end
+      end
+    elseif ev == "mouse_drag" then
+      if drag then
+        local dx, dy = b - drag.x, c - drag.y
+        if dx ~= 0 or dy ~= 0 then
+          drag.moved = true
+          panBy(-dx, -dy)
+          drag.x, drag.y = b, c
+          drawMap()
+        end
+      end
+    elseif ev == "mouse_up" then
+      if drag then
+        if not drag.moved then onMapTap(drag.x, drag.y) end
+        drag = nil
+        redrawScreen()
+      end
+    elseif ev == "mouse_scroll" then
+      if screen == "game" or screen == "pick" then
+        changeZoom(a < 0 and 1 or -1)
+        redrawScreen()
+      elseif screen == "countries" then
+        listOffset = listOffset + a
+        redrawScreen()
+      end
+    elseif ev == "key" then
+      onKey(a)
+      if not quit then redrawScreen() end
+    elseif ev == "timer" and a == timerId and screen == "game" then
       advanceDay()
       if dirty then drawMap() end
       drawTopBar()
-      drawPanel()
+      drawInfoRow()
       restartTimer()
     elseif ev == "term_resize" then
       layout()
-      if inMenu then drawMenu() else redrawAll() end
-    elseif ev == "key" then
-      if inMenu then onMenuKey(a) else onGameKey(a) end
+      redrawScreen()
     end
   end
 end
 
 local ok, err = pcall(run)
 restorePalette()
-mon.setBackgroundColor(colors.black)
-mon.clear()
-mon.setCursorPos(1, 1)
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
 if not ok then error(err, 0) end
