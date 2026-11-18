@@ -122,10 +122,12 @@ local OPTS = {
   { key = "march",  label = "Days per land step",  vals = { "2", "3", "4", "6" },                num = { 2, 3, 4, 6 } },
   { key = "events", label = "Random events",       vals = { "Off", "Rare", "Often", "Chaos" },   num = { 0, 0.02, 0.06, 0.2 } },
   { key = "auto",   label = "Auto-recruit (you)",  vals = { "Off", "On" },                       num = { 0, 1 } },
+  { key = "research", label = "Research speed",    vals = { "x0.5", "x1", "x2", "x4" },          num = { 0.5, 1, 2, 4 } },
+  { key = "autosave", label = "Autosave monthly",  vals = { "Off", "On" },                       num = { 0, 1 } },
   { key = "speed",  label = "Start speed",         vals = { "1 (slow)", "2", "3", "4 (fast)" },  num = { 1, 2, 3, 4 } },
 }
 local settings = { country = 1, observer = false, aggr = 3, expand = 2, start = 1, income = 2,
-                   cost = 2, march = 2, events = 2, auto = 1, speed = 2 }
+                   cost = 2, march = 2, events = 2, auto = 1, research = 2, autosave = 2, speed = 2 }
 local function val(key)
   for _, o in ipairs(OPTS) do
     if o.key == key then return o.num[settings[key]] end
@@ -136,6 +138,8 @@ for i, p in ipairs(provinces) do initialOwner[i] = p.owner end
 local player = playable[1]               -- nil = режим наблюдателя
 local inMenu, gameStarted, quit = true, false, false
 local enterMenu                          -- определена ниже
+local enterTech
+local inTech, techMsg, menuMsg = false, "", ""
 local menuPage = "main"
 local picking, pickSave = false, nil
 local draft = { name = "Newland", color = 1, cap = nil, size = 2 }
@@ -185,11 +189,15 @@ local function spawnDivisions()
   end
 end
 
+local bonus                  -- определена в разделе технологий
 local links = {}          -- links[i] = { { n = провинция, sea = true/false, days = дни по морю } }
 
 local function linkDays(a, b)
   for _, l in ipairs(links[a] or {}) do
-    if l.n == b then return l.sea and l.days or val("march") end
+    if l.n == b then
+      if l.sea then return l.days, true end
+      return val("march"), false
+    end
   end
   return nil
 end
@@ -265,8 +273,13 @@ end
 
 -- приказ любой страны: идти из from в to. Возвращает число отправленных дивизий (или 0, причина)
 local function moveDivisions(who, from, to, all)
-  local days = linkDays(from, to)
+  local days, isSea = linkDays(from, to)
   if not days then return 0, "No route there" end
+  if isSea then
+    days = math.max(2, math.floor(days * (1 + bonus(who, "sea")) + 0.5))
+  else
+    days = math.max(1, days + bonus(who, "march"))
+  end
   local t = provinces[to].owner
   if t ~= who and not cmap[t].neutral and not atWar(who, t) then
     return 0, "Declare war first"
@@ -290,6 +303,114 @@ local function issueMove(from, to, all)
   return moved > 0
 end
 
+------------------------------------------------------------ экономика и ИИ
+local DIV_CAP = 40                      -- лимит дивизий на страну
+local pp, dead, lastWar = {}, {}, {}
+for _, id in ipairs(countryIds) do pp[id] = 0; lastWar[id] = -999 end
+local dayCount, aiIdx = 0, 0
+local truces, warStart = {}, {}          -- перемирия (до какого дня) и дата начала войн
+
+------------------------------------------------------------ технологии
+local TECHS = {
+  { id = "ind1", branch = "Industry",  name = "Factories",       cost = 100,                 eff = { pp = 0.15 } },
+  { id = "ind2", branch = "Industry",  name = "Assembly line",   cost = 250, req = "ind1",   eff = { pp = 0.20 } },
+  { id = "ind3", branch = "Industry",  name = "Mass production", cost = 500, req = "ind2",   eff = { cost = -0.20 } },
+  { id = "arm1", branch = "Army",      name = "Drill",           cost = 100,                 eff = { atk = 0.10 } },
+  { id = "arm2", branch = "Army",      name = "Fortification",   cost = 250, req = "arm1",   eff = { def = 0.15 } },
+  { id = "arm3", branch = "Army",      name = "Shock troops",    cost = 500, req = "arm2",   eff = { atk = 0.15 } },
+  { id = "log1", branch = "Logistics", name = "Roads",           cost = 100,                 eff = { march = -1 } },
+  { id = "log2", branch = "Logistics", name = "Ports",           cost = 250, req = "log1",   eff = { sea = -0.30 } },
+  { id = "log3", branch = "Logistics", name = "Field hospitals", cost = 500, req = "log2",   eff = { regen = 0.5 } },
+  { id = "soc1", branch = "Society",   name = "Schools",         cost = 100,                 eff = { rp = 0.15 } },
+  { id = "soc2", branch = "Society",   name = "Conscription",    cost = 250, req = "soc1",   eff = { cap = 10 } },
+  { id = "soc3", branch = "Society",   name = "Universities",    cost = 500, req = "soc2",   eff = { rp = 0.25 } },
+}
+local TECH_BY_ID = {}
+for _, t in ipairs(TECHS) do TECH_BY_ID[t.id] = t end
+local tech = {}                           -- tech[страна] = { done = { id = true }, rp = очки }
+
+bonus = function(id, key)
+  local st = tech[id]
+  if not st then return 0 end
+  local sum = 0
+  for tid in pairs(st.done) do
+    local t = TECH_BY_ID[tid]
+    if t and t.eff[key] then sum = sum + t.eff[key] end
+  end
+  return sum
+end
+
+local function divCost(id) return math.max(10, math.floor(val("cost") * (1 + bonus(id, "cost")) + 0.5)) end
+local function divCap(id) return DIV_CAP + bonus(id, "cap") end
+
+local function incomeOf(id)
+  local s = 0
+  for _, p in ipairs(provinces) do
+    if p.owner == id then s = s + (0.5 + 0.5 * p.ind) * val("income") end
+  end
+  return s * (1 + bonus(id, "pp"))
+end
+
+local function researchRate(id)
+  local s = 0.2
+  for _, p in ipairs(provinces) do
+    if p.owner == id then s = s + 0.05 + 0.08 * p.ind end
+  end
+  return s * (1 + bonus(id, "rp")) * val("research")
+end
+
+local function techState(id, t)
+  local st = tech[id]
+  if st.done[t.id] then return "owned" end
+  if t.req and not st.done[t.req] then return "locked" end
+  return "open"
+end
+
+local function buyTech(id, tid)
+  local t, st = TECH_BY_ID[tid], tech[id]
+  if not t or not st then return "No such technology" end
+  local s = techState(id, t)
+  if s == "owned" then return "Already researched" end
+  if s == "locked" then return "Needs " .. TECH_BY_ID[t.req].name end
+  if st.rp < t.cost then return string.format("Need %d RP (have %d)", t.cost, math.floor(st.rp)) end
+  st.rp = st.rp - t.cost
+  st.done[tid] = true
+  addLog(cmap[id].name .. " learns " .. t.name)
+  return "Researched " .. t.name
+end
+
+local function aiResearch(id)
+  local st = tech[id]
+  if not st then return end
+  local open = {}
+  for _, t in ipairs(TECHS) do
+    if techState(id, t) == "open" and st.rp >= t.cost then open[#open + 1] = t end
+  end
+  if #open > 0 then buyTech(id, open[math.random(#open)].id) end
+end
+
+------------------------------------------------------------ война и мир
+local function startWar(a, b)
+  local k = warKey(a, b)
+  wars[k] = true
+  warStart[k] = dayCount
+  lastWar[a] = dayCount
+  addLog(cmap[a].name .. " vs " .. cmap[b].name)
+end
+
+local function makePeace(a, b)
+  local k = warKey(a, b)
+  wars[k] = nil
+  warStart[k] = nil
+  truces[k] = dayCount + 180
+  addLog("Peace: " .. cmap[a].name .. " & " .. cmap[b].name)
+end
+
+local function truceActive(a, b)
+  local t = truces[warKey(a, b)]
+  return t ~= nil and t > dayCount
+end
+
 local function declareWar()
   if not player then msgText = "Observer mode"; return end
   if not selected then msgText = "Select a province"; return end
@@ -297,16 +418,51 @@ local function declareWar()
   if t == player then msgText = "That is your land"; return end
   if cmap[t].neutral then msgText = "Unclaimed: just walk in"; return end
   if atWar(player, t) then msgText = "Already at war"; return end
-  wars[warKey(player, t)] = true
-  addLog(cmap[player].name .. " vs " .. cmap[t].name)
+  if truceActive(player, t) then
+    msgText = "Truce, " .. (truces[warKey(player, t)] - dayCount) .. " days left"
+    return
+  end
+  startWar(player, t)
   msgText = "War declared on " .. cmap[t].name
 end
 
------------------------------------------------------------- экономика и ИИ
-local DIV_CAP = 40                      -- лимит дивизий на страну
-local pp, dead, lastWar = {}, {}, {}
-for _, id in ipairs(countryIds) do pp[id] = 0; lastWar[id] = -999 end
-local dayCount, aiIdx = 0, 0
+local function proposePeace()
+  if not player then msgText = "Observer mode"; return end
+  if not selected then msgText = "Select enemy province"; return end
+  local t = provinces[selected].owner
+  if t == player or cmap[t].neutral or not atWar(player, t) then
+    msgText = "Not at war with them"
+    return
+  end
+  local mine, theirs = 0, 0
+  for _, d in ipairs(divisions) do
+    if d.owner == player then mine = mine + 1 elseif d.owner == t then theirs = theirs + 1 end
+  end
+  local age = dayCount - (warStart[warKey(player, t)] or dayCount)
+  if age >= 30 and (theirs <= mine * 1.3 or age >= 120) then
+    makePeace(player, t)
+    msgText = "Peace with " .. cmap[t].name
+  else
+    msgText = cmap[t].name .. " refuses"
+  end
+end
+
+local SAVE_FILE = fs.combine(dir, "save.dat")
+local function saveGame()
+  local owners = {}
+  for i, p in ipairs(provinces) do owners[i] = p.owner end
+  local data = {
+    v = 1, date = { y = date.y, m = date.m, d = date.d }, owners = owners, divisions = divisions,
+    wars = wars, truces = truces, warStart = warStart, pp = pp, dead = dead, lastWar = lastWar,
+    tech = tech, logLines = logLines, dayCount = dayCount, aiIdx = aiIdx, player = player or false,
+    settings = settings,
+  }
+  local h = fs.open(SAVE_FILE, "w")
+  if not h then return false end
+  h.write(textutils.serialize(data))
+  h.close()
+  return true
+end
 
 local function capitalOf(id)
   local first
@@ -338,6 +494,26 @@ local function aiTick(id)
       end
     else
       foes[d.prov] = (foes[d.prov] or 0) + 1
+    end
+  end
+
+  -- мир: ИИ заканчивает затянувшиеся войны с другими странами ИИ
+  for key in pairs(wars) do
+    local a, b = key:match("^(.-)|(.+)$")
+    if a == id or b == id then
+      local other = (a == id) and b or a
+      if other ~= player then
+        local age = dayCount - (warStart[key] or dayCount)
+        local theirs = 0
+        for _, d in ipairs(divisions) do
+          if d.owner == other then theirs = theirs + 1 end
+        end
+        local chance = (mine < theirs * 0.7) and 0.25 or 0.06
+        if age >= 60 and math.random() < chance then
+          makePeace(id, other)
+          break
+        end
+      end
     end
   end
 
@@ -393,7 +569,7 @@ local function aiTick(id)
         for _, l in ipairs(links[i]) do
           local n = l.n
           local o = provinces[n].owner
-          if o ~= id and not cmap[o].neutral and not dead[o] then
+          if o ~= id and not cmap[o].neutral and not dead[o] and not truceActive(id, o) then
             local oc = cnt[o] or 0
             if not candCnt or oc < candCnt then cand, candCnt = o, oc end
           end
@@ -401,9 +577,7 @@ local function aiTick(id)
       end
     end
     if cand and mine >= candCnt * 1.3 + 1 then
-      wars[warKey(id, cand)] = true
-      lastWar[id] = dayCount
-      addLog(cmap[id].name .. " vs " .. cmap[cand].name)
+      startWar(id, cand)
     end
   end
 end
@@ -497,12 +671,16 @@ local function economyAndAI()
         if id == player then msgText = "Your country is gone!" end
         dirty = true
       else
-        pp[id] = pp[id] + (income[id] or 0)
+        pp[id] = pp[id] + (income[id] or 0) * (1 + bonus(id, "pp"))
+        if tech[id] then
+          tech[id].rp = tech[id].rp + researchRate(id)
+          if id ~= player then aiResearch(id) end
+        end
         local auto = (id ~= player) or val("auto") == 1
-        if auto and pp[id] >= val("cost") and (cnt[id] or 0) < DIV_CAP then
+        if auto and pp[id] >= divCost(id) and (cnt[id] or 0) < divCap(id) then
           local at = capitalOf(id)
           if at then
-            pp[id] = pp[id] - val("cost")
+            pp[id] = pp[id] - divCost(id)
             addDivision(id, at)
             dirty = true
           end
@@ -514,6 +692,9 @@ local function economyAndAI()
   -- случайные события
   local ec = val("events")
   if ec > 0 and math.random() < ec then randomEvent() end
+
+  -- автосохранение раз в месяц
+  if date.d == 1 and val("autosave") == 1 and gameStarted then pcall(saveGame) end
 
   -- ИИ: две страны за день по кругу (кроме страны игрока)
   for _ = 1, 2 do
@@ -527,7 +708,7 @@ local function recruit()
   if not player then msgText = "Observer mode"; return end
   local at = (selected and provinces[selected].owner == player) and selected or capitalOf(player)
   if not at then msgText = "No province to recruit in"; return end
-  local cost = val("cost")
+  local cost = divCost(player)
   if pp[player] < cost then
     msgText = string.format("Need %d PP (have %d)", cost, math.floor(pp[player]))
     return
@@ -536,7 +717,7 @@ local function recruit()
   for _, d in ipairs(divisions) do
     if d.owner == player then n = n + 1 end
   end
-  if n >= DIV_CAP then msgText = "Division limit reached"; return end
+  if n >= divCap(player) then msgText = "Division limit reached"; return end
   pp[player] = pp[player] - cost
   addDivision(player, at)
   dirty = true
@@ -550,8 +731,12 @@ local function newGame()
   end
   divisions, nextDiv = {}, 1
   wars, battles = {}, {}
+  truces, warStart = {}, {}
   dirty, mode, msgText, logLines = false, nil, "Tap a province to start", {}
-  for _, id in ipairs(countryIds) do pp[id] = 0; lastWar[id] = -999; dead[id] = nil end
+  for _, id in ipairs(countryIds) do
+    pp[id], lastWar[id], dead[id] = 0, -999, nil
+    tech[id] = { done = {}, rp = 0 }
+  end
   dayCount, aiIdx = 0, 0
   date.y, date.m, date.d = 1936, 1, 1
   selected = nil
@@ -563,6 +748,57 @@ local function newGame()
   zi = 2
   local vw, vh = viewSize()
   vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
+end
+
+local function loadGame()
+  if not fs.exists(SAVE_FILE) then return false, "No save file" end
+  local h = fs.open(SAVE_FILE, "r")
+  if not h then return false, "Cannot open the save" end
+  local data = textutils.unserialize(h.readAll())
+  h.close()
+  if type(data) ~= "table" or data.v ~= 1 or type(data.owners) ~= "table" or #data.owners ~= #provinces then
+    return false, "Save does not match this map"
+  end
+  for i, p in ipairs(provinces) do
+    local o = data.owners[i]
+    p.owner = cmap[o] and o or neutralId
+    p.cap = baseCap[i] or capOf[i] or false
+  end
+  divisions, nextDiv = {}, 1
+  for _, d in ipairs(data.divisions or {}) do
+    if cmap[d.owner] and provinces[d.prov] and (not d.to or provinces[d.to]) then
+      divisions[#divisions + 1] = d
+      if d.id and d.id >= nextDiv then nextDiv = d.id + 1 end
+    end
+  end
+  wars = type(data.wars) == "table" and data.wars or {}
+  truces = type(data.truces) == "table" and data.truces or {}
+  warStart = type(data.warStart) == "table" and data.warStart or {}
+  for _, id in ipairs(countryIds) do
+    pp[id] = data.pp and data.pp[id] or 0
+    lastWar[id] = data.lastWar and data.lastWar[id] or -999
+    dead[id] = data.dead and data.dead[id] or nil
+    tech[id] = data.tech and data.tech[id] or { done = {}, rp = 0 }
+  end
+  battles = {}
+  logLines = data.logLines or {}
+  dayCount, aiIdx = data.dayCount or 0, data.aiIdx or 0
+  if type(data.date) == "table" then
+    date.y, date.m, date.d = data.date.y or 1936, data.date.m or 1, data.date.d or 1
+  end
+  for _, o in ipairs(OPTS) do
+    local v = data.settings and data.settings[o.key]
+    if type(v) == "number" and o.num[v] then settings[o.key] = v end
+  end
+  player = (data.player and cmap[data.player]) and data.player or nil
+  selected, mode, msgText = nil, nil, "Game loaded"
+  paused, timerId = true, nil
+  speed = val("speed")
+  zi = 2
+  local vw, vh = viewSize()
+  vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
+  dirty = true
+  return true
 end
 
 local function advanceDay()
@@ -623,11 +859,11 @@ local function advanceDay()
         battles[pi] = true
         local a, b = 0, 0
         for _, d in ipairs(inv) do
-          a = a + 10 * (d.str / 100) * (0.6 + math.random() * 0.8)
+          a = a + 10 * (1 + bonus(d.owner, "atk")) * (d.str / 100) * (0.6 + math.random() * 0.8)
           fought[d] = true
         end
         for _, d in ipairs(def) do
-          b = b + 12.5 * (d.str / 100) * (0.6 + math.random() * 0.8)
+          b = b + 12.5 * (1 + bonus(d.owner, "def")) * (d.str / 100) * (0.6 + math.random() * 0.8)
           fought[d] = true
         end
         for _, d in ipairs(def) do d.str = d.str - a / #def end
@@ -642,7 +878,7 @@ local function advanceDay()
   for _, d in ipairs(divisions) do
     if d.str > 0 then
       alive[#alive + 1] = d
-      if not fought[d] then d.str = math.min(100, d.str + 0.5) end
+      if not fought[d] then d.str = math.min(100, d.str + 0.5 + bonus(d.owner, "regen")) end
     else
       addLog(cmap[d.owner].name .. " lost a division")
       dirty = true
@@ -839,7 +1075,12 @@ local function drawPanel()
 
   if player then
     local pc = cmap[player]
-    put(x0 + 1, 2, (" You: " .. pc.name .. string.rep(" ", 22)):sub(1, 24), pc.fg, pc.color)
+    local nd = 0
+    for _, d in ipairs(divisions) do
+      if d.owner == player then nd = nd + 1 end
+    end
+    put(x0 + 1, 2, (" You: " .. pc.name .. string.rep(" ", 22)):sub(1, 18) .. string.format(" D%-3d", nd),
+      pc.fg, pc.color)
   else
     put(x0 + 1, 2, " OBSERVER (tap a country) ", colors.black, colors.white)
   end
@@ -870,17 +1111,10 @@ local function drawPanel()
     put(x0 + 1, y, "(tap a province)", colors.lightGray)
   end
 
-  -- производство игрока
+  -- производство и исследования игрока
   if player then
-    local inc, n = 0, 0
-    for _, p in ipairs(provinces) do
-      if p.owner == player then inc = inc + (0.5 + 0.5 * p.ind) * val("income") end
-    end
-    for _, d in ipairs(divisions) do
-      if d.owner == player then n = n + 1 end
-    end
-    put(x0 + 1, 10, string.format("PP %d/%d +%.1f/d  Div %d", math.floor(pp[player]), val("cost"), inc, n),
-      colors.lightGray)
+    put(x0 + 1, 10, string.format("PP %d/%d +%.1f  RP %d", math.floor(pp[player]), divCost(player),
+      incomeOf(player), math.floor(tech[player] and tech[player].rp or 0)), colors.lightGray)
   end
 
   -- страны (нажми на строку, чтобы играть за неё)
@@ -920,8 +1154,9 @@ local function drawPanel()
     moveBtn("MOVE 1", bx + 11, 9, false)
     btn("WAR", bx + 21, oy, 6, 3, colors.lightGray, function() declareWar(); return true end)
     btn("RECRUIT", bx, oy + 4, 12, 3, colors.lightGray, function() recruit(); return true end)
-    put(x0 + 14, oy + 5, "+1 division", colors.lightGray)
-    put(x0 + 14, oy + 6, "costs " .. val("cost") .. " PP", colors.lightGray)
+    btn("PEACE", bx + 13, oy + 4, 8, 3, colors.lightGray, function() proposePeace(); return true end)
+    btn("TECH", bx + 22, oy + 4, 6, 3, colors.lightGray, function() enterTech(); return false end)
+    put(x0 + 1, oy + 7, "RECRUIT: +1 division, " .. divCost(player) .. " PP", colors.lightGray)
   end
 
   put(x0 + 1, oy + 8, msgText:sub(1, PANEL_W - 2), colors.white)
@@ -1044,10 +1279,87 @@ local function onTouch(x, y)
     if x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2 then
       mode = nil
       local redraw = b.fn()
-      if inMenu then return end
+      if inMenu or inTech then return end
       if redraw then drawMap() end
       drawTopBar()
       drawPanel()
+      return
+    end
+  end
+end
+
+------------------------------------------------------------ экран технологий
+local BRANCHES = { "Industry", "Army", "Logistics", "Society" }
+local EFF_LABEL = { pp = "income", atk = "attack", def = "defense", rp = "research", sea = "sea time",
+                    cost = "unit cost" }
+
+local function pct(v) return v >= 0 and math.floor(v * 100 + 0.5) or -math.floor(-v * 100 + 0.5) end
+
+local function effText(t)
+  for k, v in pairs(t.eff) do
+    if k == "march" then return string.format("%d day per step", v)
+    elseif k == "regen" then return string.format("+%.1f heal per day", v)
+    elseif k == "cap" then return string.format("+%d division cap", v)
+    else return string.format("%+d%% %s", pct(v), EFF_LABEL[k] or k) end
+  end
+  return ""
+end
+
+local function drawTechScreen()
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  buttons = {}
+  local st = tech[player]
+  local cw = math.min(38, math.floor((W - 6) / 4))
+  local x0 = math.max(2, math.floor((W - (cw * 4 + 3)) / 2) + 1)
+  for r = 0, 2 do put(x0, 3 + r, string.rep(" ", cw * 4 + 3), colors.black, colors.white) end
+  put(x0 + 2, 4, string.format("TECHNOLOGY  -  %s     RP %d  (+%.1f per day)", cmap[player].name,
+    math.floor(st.rp), researchRate(player)), colors.black, colors.white)
+  for bi, br in ipairs(BRANCHES) do
+    local cx = x0 + (bi - 1) * (cw + 1)
+    put(cx, 8, br:upper(), colors.lightBlue)
+    local y = 10
+    for _, t in ipairs(TECHS) do
+      if t.branch == br then
+        local state = techState(player, t)
+        local col = (state == "owned") and colors.white or ((state == "open") and colors.lightGray or colors.gray)
+        local fg = (state == "locked") and colors.white or colors.black
+        for r = 0, 3 do put(cx, y + r, string.rep(" ", cw), fg, col) end
+        put(cx + 1, y, t.name:sub(1, cw - 2), fg, col)
+        put(cx + 1, y + 1, effText(t):sub(1, cw - 2), fg, col)
+        local line3
+        if state == "owned" then line3 = "RESEARCHED"
+        elseif state == "locked" then line3 = "needs " .. TECH_BY_ID[t.req].name
+        else line3 = string.format("BUY for %d RP", t.cost) end
+        put(cx + 1, y + 3, line3:sub(1, cw - 2), fg, col)
+        buttons[#buttons + 1] = { x1 = cx, x2 = cx + cw - 1, y1 = y, y2 = y + 3, fn = function()
+          techMsg = buyTech(player, t.id)
+          return true
+        end }
+        y = y + 5
+      end
+    end
+  end
+  put(x0, 31, techMsg, colors.white)
+  btn("BACK", x0, 33, 20, 3, colors.lightGray, function()
+    inTech = false
+    redrawAll()
+    return false
+  end)
+end
+
+enterTech = function()
+  if not player then msgText = "Observer: no technologies"; return end
+  inTech, paused, timerId = true, true, nil
+  techMsg = "Tap a technology to research it"
+  drawTechScreen()
+end
+
+local function onTechTouch(x, y)
+  for _, bt in ipairs(buttons) do
+    if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
+      bt.fn()
+      if inTech then drawTechScreen() end
       return
     end
   end
@@ -1235,14 +1547,34 @@ local function drawMainPage()
     menuPage = "create"; createMsg = ""; return true
   end)
   if gameStarted then
-    btn("RESUME", x0, 30, MW, 3, colors.lightGray, function()
+    btn("SAVE GAME", x0, 30, 25, 3, colors.lightGray, function()
+      menuMsg = saveGame() and "Game saved" or "Could not save"
+      return true
+    end)
+  end
+  if fs.exists(SAVE_FILE) then
+    btn("LOAD GAME", x0 + 27, 30, 25, 3, colors.lightGray, function()
+      local ok, why = loadGame()
+      if ok then
+        gameStarted = true
+        inMenu = false
+        redrawAll()
+        return false
+      end
+      menuMsg = why
+      return true
+    end)
+  end
+  if gameStarted then
+    btn("RESUME", x0, 34, MW, 3, colors.lightGray, function()
       inMenu = false
       redrawAll()
       return false
     end)
   end
-  btn("QUIT", x0, 34, MW, 3, colors.lightGray, function() quit = true; return false end)
-  put(x0, 39, "Tap the buttons on the monitor. Q on the computer also quits.", colors.lightGray)
+  btn("QUIT", x0, 38, MW, 3, colors.lightGray, function() quit = true; return false end)
+  put(x0, 42, menuMsg:sub(1, MW), colors.white)
+  put(x0, 44, "Tap the buttons on the monitor. Q on the computer also quits.", colors.lightGray)
 end
 
 local function drawSettingsPage()
@@ -1330,8 +1662,10 @@ local function run()
   while not quit do
     local ev, a, b, c = os.pullEvent()
     if ev == "monitor_touch" and a == monName then
-      if inMenu then onMenuTouch(b, c) else onTouch(b, c) end
-    elseif ev == "timer" and a == timerId and not inMenu then
+      if inMenu then onMenuTouch(b, c)
+      elseif inTech then onTechTouch(b, c)
+      else onTouch(b, c) end
+    elseif ev == "timer" and a == timerId and not inMenu and not inTech then
       advanceDay()
       if dirty then drawMap() end
       drawTopBar()
@@ -1339,7 +1673,7 @@ local function run()
       restartTimer()
     elseif ev == "monitor_resize" and a == monName then
       layout()
-      if inMenu then drawMenu() else redrawAll() end
+      if inMenu then drawMenu() elseif inTech then drawTechScreen() else redrawAll() end
     elseif ev == "key" and a == keys.q then
       return
     end
