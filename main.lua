@@ -1039,9 +1039,14 @@ local function sendLobbyUpdate(recipient)
     v = 1, kind = "lobby", code = net.code, session = net.session,
     members = lobbyMembers(), settings = cloneSettings(),
   }
-  if recipient then rednet.send(recipient, packet, NET_PROTOCOL)
+  if recipient then
+    packet.assignedCountry = net.peers[recipient] and net.peers[recipient].country
+    rednet.send(recipient, packet, NET_PROTOCOL)
   else
-    for id in pairs(net.peers) do rednet.send(id, packet, NET_PROTOCOL) end
+    for id, peer in pairs(net.peers) do
+      packet.assignedCountry = peer.country
+      rednet.send(id, packet, NET_PROTOCOL)
+    end
   end
 end
 
@@ -1067,7 +1072,10 @@ local function startLobbyGame()
     v = 1, kind = "start", session = net.session,
     country = net.country, settings = cloneSettings(), state = makeNetSnapshot(),
   }
-  for id in pairs(net.peers) do rednet.send(id, packet, NET_PROTOCOL) end
+  for id, peer in pairs(net.peers) do
+    packet.country = peer.country
+    rednet.send(id, packet, NET_PROTOCOL)
+  end
   return true
 end
 
@@ -1221,6 +1229,21 @@ local function handleNetMessage(sender, packet)
         country = peer.country, settings = cloneSettings(), mapKey = MAP_KEY,
       }, NET_PROTOCOL)
       sendLobbyUpdate()
+    elseif packet.kind == "country" and packet.session == net.session and net.peers[sender]
+        and type(packet.country) == "string" then
+      local valid, available = false, packet.country ~= net.country
+      for _, id in ipairs(playable) do
+        if id == packet.country then valid = true; break end
+      end
+      for id, peer in pairs(net.peers) do
+        if id ~= sender and peer.country == packet.country then available = false end
+      end
+      if valid and available then
+        net.peers[sender].country = packet.country
+        net.hostReady = false
+        for _, peer in pairs(net.peers) do peer.ready = false end
+      end
+      sendLobbyUpdate()
     elseif packet.kind == "ready" and packet.session == net.session and net.peers[sender]
         and type(packet.ready) == "boolean" then
       net.peers[sender].ready = packet.ready
@@ -1246,6 +1269,9 @@ local function handleNetMessage(sender, packet)
       menuPage, inMenu, menuMsg = "lobby", true, ""
     elseif packet.kind == "lobby" and inMenu and type(packet.members) == "table" then
       net.members, net.settings = packet.members, packet.settings
+      if cmap[packet.assignedCountry] and not cmap[packet.assignedCountry].neutral then
+        net.country = packet.assignedCountry
+      end
     elseif packet.kind == "start" and inMenu and cmap[packet.country] and type(packet.settings) == "table" then
       net.country = packet.country
       for _, o in ipairs(OPTS) do
@@ -1838,9 +1864,9 @@ local function effText(t)
   return table.concat(parts, ", ")
 end
 
-local function drawTechScreen()
+local function drawTechScreen(keepScreen)
   mon.setBackgroundColor(colors.black)
-  mon.clear()
+  if not keepScreen then mon.clear() end
   buttons = {}
   local st = tech[player]
   local cw = math.min(38, math.floor((W - 6) / 4))
@@ -1899,9 +1925,9 @@ local function onTechTouch(x, y)
   end
 end
 
-local function drawBuildScreen()
+local function drawBuildScreen(keepScreen)
   mon.setBackgroundColor(colors.black)
-  mon.clear()
+  if not keepScreen then mon.clear() end
   buttons = {}
   local bw = math.min(52, W - 4)
   local x0 = math.max(2, math.floor((W - bw) / 2) + 1)
@@ -2379,7 +2405,39 @@ function menu.drawLobbyPage()
       return true
     end)
   else
-    put(x0, 23, "Host controls game settings.", colors.lightGray)
+    local countryIndex = 1
+    for i, id in ipairs(playable) do
+      if id == net.country then countryIndex = i; break end
+    end
+    local function requestCountry(step)
+      local used = {}
+      for _, member in ipairs(net.members or {}) do
+        if member.id ~= net.id then used[member.country] = true end
+      end
+      for _ = 1, #playable do
+        countryIndex = (countryIndex - 1 + step) % #playable + 1
+        local candidate = playable[countryIndex]
+        if not used[candidate] then
+          rednet.send(net.host, {
+            v = 1, kind = "country", session = net.session, country = candidate,
+          }, NET_PROTOCOL)
+          return
+        end
+      end
+      menuMsg = "No other countries available"
+    end
+    local country = cmap[net.country]
+    put(x0, 23, "CHOOSE YOUR FACTION", colors.lightBlue)
+    btn("<", x0, 25, 10, 3, colors.lightGray, function()
+      requestCountry(-1)
+      return true
+    end)
+    put(x0 + 11, 26, (country and country.name or "?"):sub(1, menu.MW - 22), colors.white)
+    btn(">", x0 + menu.MW - 10, 25, 10, 3, colors.lightGray, function()
+      requestCountry(1)
+      return true
+    end)
+    put(x0, 30, "Host controls game settings.", colors.lightGray)
     btn(net.ready and "NOT READY" or "READY", x0, 35, 25, 3, colors.white, function()
       net.ready = not net.ready
       rednet.send(net.host, { v = 1, kind = "ready", session = net.session, ready = net.ready }, NET_PROTOCOL)
@@ -2521,11 +2579,17 @@ local function run()
       end
       restartTimer()
     elseif ev == "rednet_message" and c == NET_PROTOCOL then
+      local wasInMenu = inMenu
       handleNetMessage(a, b)
       if inMenu then menu.draw()
-      elseif inTech then drawTechScreen()
-      elseif inBuild then drawBuildScreen()
-      else redrawAll() end
+      elseif wasInMenu then redrawAll()
+      elseif inTech then drawTechScreen(true)
+      elseif inBuild then drawBuildScreen(true)
+      else
+        drawMap()
+        drawTopBar()
+        drawPanel()
+      end
     elseif ev == "monitor_resize" and a == monName then
       layout()
       if inMenu then menu.draw() elseif inTech then drawTechScreen() elseif inBuild then drawBuildScreen() else redrawAll() end
