@@ -324,6 +324,13 @@ local TECHS = {
   { id = "soc1", branch = "Society",   name = "Schools",         cost = 100,                 eff = { rp = 0.15 } },
   { id = "soc2", branch = "Society",   name = "Conscription",    cost = 250, req = "soc1",   eff = { cap = 10 } },
   { id = "soc3", branch = "Society",   name = "Universities",    cost = 500, req = "soc2",   eff = { rp = 0.25 } },
+
+  -- Дополнительные национальные фокусы: по одному завершающему узлу
+  -- в каждой ветке. Это долгосрочные специализации страны.
+  { id = "ind4", branch = "Industry",  name = "Industrial Focus",  cost = 800, req = "ind3", eff = { pp = 0.30 } },
+  { id = "arm4", branch = "Army",      name = "Air Support Doctrine", cost = 800, req = "arm3", eff = { atk = 0.20, def = 0.05 } },
+  { id = "log4", branch = "Logistics", name = "Fleet Transport Focus", cost = 800, req = "log3", eff = { sea = -0.35, march = -1 } },
+  { id = "soc4", branch = "Society",   name = "National Mobilization", cost = 800, req = "soc3", eff = { cap = 30, rp = 0.10 } },
 }
 local TECH_BY_ID = {}
 for _, t in ipairs(TECHS) do TECH_BY_ID[t.id] = t end
@@ -341,7 +348,20 @@ bonus = function(id, key)
 end
 
 local function divCost(id) return math.max(10, math.floor(val("cost") * (1 + bonus(id, "cost")) + 0.5)) end
-local function divCap(id) return DIV_CAP + bonus(id, "cap") end
+
+-- Лимит растёт вместе с территорией: крупные страны не получают
+-- искусственно такое же ограничение, как маленькие.
+local function ownedProvinceCount(id)
+  local n = 0
+  for _, p in ipairs(provinces) do
+    if p.owner == id then n = n + 1 end
+  end
+  return n
+end
+
+local function divCap(id)
+  return DIV_CAP + ownedProvinceCount(id) * 3 + bonus(id, "cap")
+end
 
 local function incomeOf(id)
   local s = 0
@@ -599,7 +619,11 @@ local function randomEvent()
     addLog(name .. ": good harvest +30 PP")
   elseif k == 3 then
     local at = capitalOf(id)
-    if at then
+    local count = 0
+    for _, d in ipairs(divisions) do
+      if d.owner == id then count = count + 1 end
+    end
+    if at and count < divCap(id) then
       addDivision(id, at)
       addLog(name .. ": volunteers join")
       dirty = true
@@ -1113,8 +1137,14 @@ local function drawPanel()
 
   -- производство и исследования игрока
   if player then
-    put(x0 + 1, 10, string.format("PP %d/%d +%.1f  RP %d", math.floor(pp[player]), divCost(player),
-      incomeOf(player), math.floor(tech[player] and tech[player].rp or 0)), colors.lightGray)
+    put(x0 + 1, 10, string.format("PP %d/%d +%.1f RP %d D %d/%d",
+      math.floor(pp[player]), divCost(player), incomeOf(player),
+      math.floor(tech[player] and tech[player].rp or 0),
+      (function()
+        local n = 0
+        for _, d in ipairs(divisions) do if d.owner == player then n = n + 1 end end
+        return n
+      end)(), divCap(player)), colors.lightGray)
   end
 
   -- страны (нажми на строку, чтобы играть за неё)
@@ -1156,7 +1186,7 @@ local function drawPanel()
     btn("RECRUIT", bx, oy + 4, 12, 3, colors.lightGray, function() recruit(); return true end)
     btn("PEACE", bx + 13, oy + 4, 8, 3, colors.lightGray, function() proposePeace(); return true end)
     btn("TECH", bx + 22, oy + 4, 6, 3, colors.lightGray, function() enterTech(); return false end)
-    put(x0 + 1, oy + 7, "RECRUIT: +1 division, " .. divCost(player) .. " PP", colors.lightGray)
+    put(x0 + 1, oy + 7, "RECRUIT: " .. divCost(player) .. " PP | cap grows with land", colors.lightGray)
   end
 
   put(x0 + 1, oy + 8, msgText:sub(1, PANEL_W - 2), colors.white)
@@ -1296,13 +1326,20 @@ local EFF_LABEL = { pp = "income", atk = "attack", def = "defense", rp = "resear
 local function pct(v) return v >= 0 and math.floor(v * 100 + 0.5) or -math.floor(-v * 100 + 0.5) end
 
 local function effText(t)
+  local parts = {}
   for k, v in pairs(t.eff) do
-    if k == "march" then return string.format("%d day per step", v)
-    elseif k == "regen" then return string.format("+%.1f heal per day", v)
-    elseif k == "cap" then return string.format("+%d division cap", v)
-    else return string.format("%+d%% %s", pct(v), EFF_LABEL[k] or k) end
+    if k == "march" then
+      parts[#parts + 1] = string.format("%+d day/step", v)
+    elseif k == "regen" then
+      parts[#parts + 1] = string.format("+%.1f heal/day", v)
+    elseif k == "cap" then
+      parts[#parts + 1] = string.format("+%d division cap", v)
+    else
+      parts[#parts + 1] = string.format("%+d%% %s", pct(v), EFF_LABEL[k] or k)
+    end
   end
-  return ""
+  table.sort(parts)
+  return table.concat(parts, ", ")
 end
 
 local function drawTechScreen()
