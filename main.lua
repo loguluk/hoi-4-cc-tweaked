@@ -158,6 +158,7 @@ local player = playable[1]               -- nil = режим наблюдате�
 local inMenu, gameStarted, quit = true, false, false
 local enterMenu                          -- определена ниже
 local drawMenu
+local onMenuTouch
 local enterTech
 local enterBuild
 local inTech, inBuild, techMsg, buildMsg, menuMsg = false, false, "", "", ""
@@ -2081,6 +2082,7 @@ local function askName()
 end
 
 ------------------------------------------------------------ меню
+do
 local MW = 52
 local function mx() return math.max(2, math.floor((W - MW) / 2) + 1) end
 
@@ -2467,7 +2469,7 @@ enterMenu = function()
   drawMenu()
 end
 
-local function onMenuTouch(x, y)
+onMenuTouch = function(x, y)
   for _, bt in ipairs(buttons) do
     if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
       bt.fn()
@@ -2476,6 +2478,7 @@ local function onMenuTouch(x, y)
       return
     end
   end
+end
 end
 
 ------------------------------------------------------------ старт
