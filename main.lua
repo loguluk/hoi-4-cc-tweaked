@@ -1,10 +1,26 @@
--- main.lua v4: HOI-подобная стратегия для CC:Tweaked (дивизии, приказы, война)
+-- main.lua v4: HOI-подобная стратегия для CC:Tweaked (армия, авиация, флот, приказы, война)
 -- Карта берётся из map.lua (генерируется gen_map.py). Рядом должен лежать map.lua.
 -- Управление только нажатиями на монитор. Выход: клавиша Q на компьютере.
 
 local dir = fs.getDir(shell.getRunningProgram())
 local map = dofile(fs.combine(dir, "map.lua"))
 local provinces = map.provinces
+local function makeMapKey()
+  local parts = { tostring(map.w), tostring(map.h) }
+  for _, c in ipairs(map.countries) do
+    parts[#parts + 1] = table.concat({ c.id, c.name, c.color, c.fg, tostring(c.neutral) }, ":")
+  end
+  for _, p in ipairs(provinces) do
+    parts[#parts + 1] = table.concat({
+      p.name, p.owner, p.cx, p.cy, tostring(p.cap), p.pop, p.ind, tostring(p.coast), table.concat(p.nb, ",")
+    }, ":")
+  end
+  parts[#parts + 1] = table.concat(map.rows, "|")
+  local source, hash = table.concat(parts, "|"), 5381
+  for i = 1, #source do hash = (hash * 33 + source:byte(i)) % 2147483647 end
+  return tostring(#provinces) .. ":" .. tostring(hash)
+end
+local MAP_KEY = makeMapKey()
 
 ------------------------------------------------------------ монитор
 local mon = peripheral.find("monitor")
@@ -139,7 +155,8 @@ local player = playable[1]               -- nil = режим наблюдате�
 local inMenu, gameStarted, quit = true, false, false
 local enterMenu                          -- определена ниже
 local enterTech
-local inTech, techMsg, menuMsg = false, "", ""
+local enterBuild
+local inTech, inBuild, techMsg, buildMsg, menuMsg = false, false, "", "", ""
 local menuPage = "main"
 local picking, pickSave = false, nil
 local draft = { name = "Newland", color = 1, cap = nil, size = 2 }
@@ -175,8 +192,8 @@ local function addLog(text)
   if #logLines > 8 then table.remove(logLines) end
 end
 
-local function addDivision(owner, prov)
-  divisions[#divisions + 1] = { id = nextDiv, owner = owner, prov = prov, str = 100 }
+local function addDivision(owner, prov, kind)
+  divisions[#divisions + 1] = { id = nextDiv, owner = owner, prov = prov, str = 100, kind = kind }
   nextDiv = nextDiv + 1
 end
 
@@ -192,11 +209,11 @@ end
 local bonus                  -- определена в разделе технологий
 local links = {}          -- links[i] = { { n = провинция, sea = true/false, days = дни по морю } }
 
-local function linkDays(a, b)
+local function linkDays(a, b, seaOnly)
   for _, l in ipairs(links[a] or {}) do
     if l.n == b then
       if l.sea then return l.days, true end
-      return val("march"), false
+      if not seaOnly then return val("march"), false end
     end
   end
   return nil
@@ -273,13 +290,6 @@ end
 
 -- приказ любой страны: идти из from в to. Возвращает число отправленных дивизий (или 0, причина)
 local function moveDivisions(who, from, to, all)
-  local days, isSea = linkDays(from, to)
-  if not days then return 0, "No route there" end
-  if isSea then
-    days = math.max(2, math.floor(days * (1 + bonus(who, "sea")) + 0.5))
-  else
-    days = math.max(1, days + bonus(who, "march"))
-  end
   local t = provinces[to].owner
   if t ~= who and not cmap[t].neutral and not atWar(who, t) then
     return 0, "Declare war first"
@@ -287,10 +297,19 @@ local function moveDivisions(who, from, to, all)
   local moved = 0
   for _, d in ipairs(divisions) do
     if d.owner == who and d.prov == from and not d.to and (all or moved < 1) then
-      d.to, d.left = to, days
-      moved = moved + 1
+      local days, isSea = linkDays(from, to, d.kind == "navy")
+      if days then
+        if isSea then
+          days = math.max(2, math.floor(days * (1 + bonus(who, "sea")) + 0.5))
+        else
+          days = math.max(1, days + bonus(who, "march"))
+        end
+        d.to, d.left = to, days
+        moved = moved + 1
+      end
     end
   end
+  if moved == 0 then return 0, "No suitable route for these units" end
   return moved
 end
 
@@ -472,7 +491,7 @@ local function saveGame()
   local owners = {}
   for i, p in ipairs(provinces) do owners[i] = p.owner end
   local data = {
-    v = 1, date = { y = date.y, m = date.m, d = date.d }, owners = owners, divisions = divisions,
+    v = 1, mapKey = MAP_KEY, date = { y = date.y, m = date.m, d = date.d }, owners = owners, divisions = divisions,
     wars = wars, truces = truces, warStart = warStart, pp = pp, dead = dead, lastWar = lastWar,
     tech = tech, logLines = logLines, dayCount = dayCount, aiIdx = aiIdx, player = player or false,
     settings = settings,
@@ -748,6 +767,32 @@ local function recruit()
   msgText = "Recruited in " .. provinces[at].name
 end
 
+local SPECIAL_UNITS = { air = 300, navy = 200 }
+local function buySpecialUnit(kind)
+  if not player then buildMsg = "Observer mode"; return end
+  local cost = SPECIAL_UNITS[kind]
+  if not cost then buildMsg = "Unknown unit"; return end
+  local at = (selected and provinces[selected].owner == player) and selected or capitalOf(player)
+  if not at then buildMsg = "No province to deploy in"; return end
+  if kind == "navy" and not provinces[at].coast then
+    buildMsg = "Fleet requires a coastal province"
+    return
+  end
+  local count = 0
+  for _, d in ipairs(divisions) do
+    if d.owner == player then count = count + 1 end
+  end
+  if count >= divCap(player) then buildMsg = "Division limit reached"; return end
+  if pp[player] < cost then
+    buildMsg = string.format("Need %d PP (have %d)", cost, math.floor(pp[player]))
+    return
+  end
+  pp[player] = pp[player] - cost
+  addDivision(player, at, kind)
+  dirty = true
+  buildMsg = (kind == "air" and "Air division" or "Fleet division") .. " deployed in " .. provinces[at].name
+end
+
 local function newGame()
   for i, p in ipairs(provinces) do
     p.owner = initialOwner[i]
@@ -783,6 +828,7 @@ local function loadGame()
   if type(data) ~= "table" or data.v ~= 1 or type(data.owners) ~= "table" or #data.owners ~= #provinces then
     return false, "Save does not match this map"
   end
+  if data.mapKey and data.mapKey ~= MAP_KEY then return false, "Save belongs to a different map" end
   for i, p in ipairs(provinces) do
     local o = data.owners[i]
     p.owner = cmap[o] and o or neutralId
@@ -791,6 +837,7 @@ local function loadGame()
   divisions, nextDiv = {}, 1
   for _, d in ipairs(data.divisions or {}) do
     if cmap[d.owner] and provinces[d.prov] and (not d.to or provinces[d.to]) then
+      if d.kind ~= "air" and d.kind ~= "navy" then d.kind = nil end
       divisions[#divisions + 1] = d
       if d.id and d.id >= nextDiv then nextDiv = d.id + 1 end
     end
@@ -883,11 +930,13 @@ local function advanceDay()
         battles[pi] = true
         local a, b = 0, 0
         for _, d in ipairs(inv) do
-          a = a + 10 * (1 + bonus(d.owner, "atk")) * (d.str / 100) * (0.6 + math.random() * 0.8)
+          local unitPower = d.kind == "air" and 1.35 or (d.kind == "navy" and 1.15 or 1)
+          a = a + 10 * unitPower * (1 + bonus(d.owner, "atk")) * (d.str / 100) * (0.6 + math.random() * 0.8)
           fought[d] = true
         end
         for _, d in ipairs(def) do
-          b = b + 12.5 * (1 + bonus(d.owner, "def")) * (d.str / 100) * (0.6 + math.random() * 0.8)
+          local unitPower = d.kind == "air" and 0.8 or (d.kind == "navy" and 1.1 or 1)
+          b = b + 12.5 * unitPower * (1 + bonus(d.owner, "def")) * (d.str / 100) * (0.6 + math.random() * 0.8)
           fought[d] = true
         end
         for _, d in ipairs(def) do d.str = d.str - a / #def end
@@ -1185,7 +1234,7 @@ local function drawPanel()
     btn("WAR", bx + 21, oy, 6, 3, colors.lightGray, function() declareWar(); return true end)
     btn("RECRUIT", bx, oy + 4, 12, 3, colors.lightGray, function() recruit(); return true end)
     btn("PEACE", bx + 13, oy + 4, 8, 3, colors.lightGray, function() proposePeace(); return true end)
-    btn("TECH", bx + 22, oy + 4, 6, 3, colors.lightGray, function() enterTech(); return false end)
+    btn("BUILD", bx + 22, oy + 4, 6, 3, colors.lightGray, function() enterBuild(); return false end)
     put(x0 + 1, oy + 7, "RECRUIT: " .. divCost(player) .. " PP | cap grows with land", colors.lightGray)
   end
 
@@ -1309,7 +1358,7 @@ local function onTouch(x, y)
     if x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2 then
       mode = nil
       local redraw = b.fn()
-      if inMenu or inTech then return end
+      if inMenu or inTech or inBuild then return end
       if redraw then drawMap() end
       drawTopBar()
       drawPanel()
@@ -1387,6 +1436,7 @@ end
 
 enterTech = function()
   if not player then msgText = "Observer: no technologies"; return end
+  inBuild = false
   inTech, paused, timerId = true, true, nil
   techMsg = "Tap a technology to research it"
   drawTechScreen()
@@ -1397,6 +1447,58 @@ local function onTechTouch(x, y)
     if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
       bt.fn()
       if inTech then drawTechScreen() end
+      return
+    end
+  end
+end
+
+local function drawBuildScreen()
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  buttons = {}
+  local bw = math.min(52, W - 4)
+  local x0 = math.max(2, math.floor((W - bw) / 2) + 1)
+  for r = 0, 2 do put(x0, 3 + r, string.rep(" ", bw), colors.black, colors.white) end
+  put(x0 + 2, 4, ("ARMY PRODUCTION  -  " .. cmap[player].name):sub(1, bw - 4), colors.black, colors.white)
+  put(x0, 8, string.format("PP %d | divisions %d/%d", math.floor(pp[player]), (function()
+    local n = 0
+    for _, d in ipairs(divisions) do if d.owner == player then n = n + 1 end end
+    return n
+  end)(), divCap(player)), colors.lightGray)
+  put(x0, 10, "Deploy in selected own province, otherwise in capital.", colors.lightGray)
+  btn("BUY AIR DIVISION  -  300 PP  (strong attack)", x0, 13, bw, 4, colors.lightGray, function()
+    buySpecialUnit("air")
+    return true
+  end)
+  btn("BUY FLEET DIVISION  -  200 PP  (coast only)", x0, 19, bw, 4, colors.lightGray, function()
+    buySpecialUnit("navy")
+    return true
+  end)
+  put(x0, 25, buildMsg:sub(1, bw), colors.white)
+  btn("TECHNOLOGY", x0, 28, bw, 3, colors.lightGray, function()
+    inBuild = false
+    enterTech()
+    return false
+  end)
+  btn("BACK TO MAP", x0, 33, bw, 3, colors.lightGray, function()
+    inBuild = false
+    redrawAll()
+    return false
+  end)
+end
+
+enterBuild = function()
+  if not player then msgText = "Observer mode"; return end
+  inTech, inBuild, paused, timerId = false, true, true, nil
+  buildMsg = "Choose a unit to produce"
+  drawBuildScreen()
+end
+
+local function onBuildTouch(x, y)
+  for _, bt in ipairs(buttons) do
+    if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
+      bt.fn()
+      if inBuild then drawBuildScreen() end
       return
     end
   end
@@ -1672,6 +1774,7 @@ end
 
 enterMenu = function()
   if picking then endPick(nil); return end
+  inTech, inBuild = false, false
   inMenu = true
   paused = true
   timerId = nil
@@ -1701,8 +1804,9 @@ local function run()
     if ev == "monitor_touch" and a == monName then
       if inMenu then onMenuTouch(b, c)
       elseif inTech then onTechTouch(b, c)
+      elseif inBuild then onBuildTouch(b, c)
       else onTouch(b, c) end
-    elseif ev == "timer" and a == timerId and not inMenu and not inTech then
+    elseif ev == "timer" and a == timerId and not inMenu and not inTech and not inBuild then
       advanceDay()
       if dirty then drawMap() end
       drawTopBar()
@@ -1710,7 +1814,7 @@ local function run()
       restartTimer()
     elseif ev == "monitor_resize" and a == monName then
       layout()
-      if inMenu then drawMenu() elseif inTech then drawTechScreen() else redrawAll() end
+      if inMenu then drawMenu() elseif inTech then drawTechScreen() elseif inBuild then drawBuildScreen() else redrawAll() end
     elseif ev == "key" and a == keys.q then
       return
     end
