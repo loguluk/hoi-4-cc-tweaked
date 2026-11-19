@@ -123,6 +123,9 @@ local SPEEDS = { 1.0, 0.5, 0.2, 0.05 }
 local date = { y = 1936, m = 1, d = 1 }
 local timerId = nil
 local buttons = {}
+local MOVE_TYPES = { "all", "land", "air", "navy" }
+local MOVE_LABELS = { all = "ALL", land = "LAND", air = "AIR", navy = "NAVY" }
+local moveTypeIndex = 1
 
 ------------------------------------------------------------ игровая логика (без отрисовки)
 local playable = {}                  -- страны, за которые можно играть (без нейтральной)
@@ -154,10 +157,21 @@ for i, p in ipairs(provinces) do initialOwner[i] = p.owner end
 local player = playable[1]               -- nil = режим наблюдателя
 local inMenu, gameStarted, quit = true, false, false
 local enterMenu                          -- определена ниже
+local drawMenu
 local enterTech
 local enterBuild
 local inTech, inBuild, techMsg, buildMsg, menuMsg = false, false, "", "", ""
 local menuPage = "main"
+local menuReturnPage = "main"
+local NET_PROTOCOL = "hoi_cc_lobby_v1"
+local net = { role = "single" }
+local netSeq = 0
+local lobbyBrowser, selectedLobby = {}, nil
+local lobbyBrowserPage = 1
+local browserScanTimer = nil
+local joinTimer = nil
+local passwordInput, passwordPurpose = "", nil
+local lobbySetting = 1
 local picking, pickSave = false, nil
 local draft = { name = "Newland", color = 1, cap = nil, size = 2 }
 local createMsg = ""
@@ -169,11 +183,46 @@ local divisions, nextDiv = {}, 1
 local wars = {}
 local battles = {}          -- провинции с боем в текущий день
 local dirty = false         -- нужно ли перерисовать карту
-local mode = nil            -- режим приказа: { all = true/false }
+local mode = nil            -- режим приказа: { all = true/false, kind = тип частей }
 local msgText = ""
 local logLines = {}
 
 math.randomseed(os.epoch("utc"))
+
+local function openLobbyNetwork()
+  local modem = peripheral.find("modem")
+  if not modem then return false, "Attach an ender modem first" end
+  local name = peripheral.getName(modem)
+  if not rednet.isOpen(name) then rednet.open(name) end
+  return true
+end
+
+local function lobbyCode()
+  local chars, out = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789", {}
+  for i = 1, 6 do
+    local n = math.random(#chars)
+    out[i] = chars:sub(n, n)
+  end
+  return table.concat(out)
+end
+
+local function sendNetAction(action, data)
+  if net.role ~= "client" or not net.host then return false end
+  netSeq = netSeq + 1
+  local packet = {
+    v = 1, kind = "action", session = net.session, seq = netSeq,
+    action = action, data = data or {},
+  }
+  rednet.send(net.host, packet, NET_PROTOCOL)
+  return true
+end
+
+local function cloneSettings()
+  local copy = {}
+  for _, o in ipairs(OPTS) do copy[o.key] = settings[o.key] end
+  copy.observer = false
+  return copy
+end
 
 local function daysInMonth(y, m)
   local t = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
@@ -289,19 +338,28 @@ local function buildLinks()
 end
 
 -- приказ любой страны: идти из from в to. Возвращает число отправленных дивизий (или 0, причина)
-local function moveDivisions(who, from, to, all)
+local function moveDivisions(who, from, to, all, kind)
   local t = provinces[to].owner
   if t ~= who and not cmap[t].neutral and not atWar(who, t) then
     return 0, "Declare war first"
   end
   local moved = 0
   for _, d in ipairs(divisions) do
-    if d.owner == who and d.prov == from and not d.to and (all or moved < 1) then
-      local days, isSea = linkDays(from, to, d.kind == "navy")
+    local unitKind = d.kind or "land"
+    if d.owner == who and d.prov == from and not d.to and (not kind or kind == "all" or unitKind == kind)
+        and (all or moved < 1) then
+      local days, isSea
+      if unitKind == "air" then
+        days = 1
+      elseif unitKind == "navy" then
+        if provinces[from].coast and provinces[to].coast then days, isSea = 4, true end
+      else
+        days, isSea = linkDays(from, to)
+      end
       if days then
         if isSea then
           days = math.max(2, math.floor(days * (1 + bonus(who, "sea")) + 0.5))
-        else
+        elseif unitKind == "land" then
           days = math.max(1, days + bonus(who, "march"))
         end
         d.to, d.left = to, days
@@ -309,16 +367,27 @@ local function moveDivisions(who, from, to, all)
       end
     end
   end
-  if moved == 0 then return 0, "No suitable route for these units" end
+  if moved == 0 then
+    if kind == "air" then return 0, "No ready air divisions" end
+    if kind == "navy" and not provinces[to].coast then return 0, "Fleets can only move to coasts" end
+    if kind == "navy" then return 0, "No ready fleet divisions" end
+    return 0, "No suitable route for these units"
+  end
   return moved
 end
 
 -- приказ игрока. Возвращает true, если карта изменилась.
-local function issueMove(from, to, all)
+local function issueMove(from, to, all, kind)
   if not player then msgText = "Observer mode"; return false end
-  local moved, why = moveDivisions(player, from, to, all)
+  if net.role == "client" then
+    sendNetAction("move", { from = from, to = to, all = all, kind = kind or "all" })
+    msgText = "Order sent to host"
+    return false
+  end
+  local moved, why = moveDivisions(player, from, to, all, kind)
   if why then msgText = why; return false end
-  msgText = moved > 0 and (moved .. " div -> " .. provinces[to].name) or "No ready divisions"
+  local label = (kind and kind ~= "all") and (" " .. kind:upper()) or ""
+  msgText = moved > 0 and (moved .. label .. " div -> " .. provinces[to].name) or "No ready divisions"
   return moved > 0
 end
 
@@ -406,6 +475,11 @@ local function techState(id, t)
 end
 
 local function buyTech(id, tid)
+  if net.role == "client" and id == player then
+    sendNetAction("tech", { id = tid })
+    techMsg = "Research request sent to host"
+    return techMsg
+  end
   local t, st = TECH_BY_ID[tid], tech[id]
   if not t or not st then return "No such technology" end
   local s = techState(id, t)
@@ -453,6 +527,11 @@ end
 local function declareWar()
   if not player then msgText = "Observer mode"; return end
   if not selected then msgText = "Select a province"; return end
+  if net.role == "client" then
+    sendNetAction("war", { target = selected })
+    msgText = "War request sent to host"
+    return
+  end
   local t = provinces[selected].owner
   if t == player then msgText = "That is your land"; return end
   if cmap[t].neutral then msgText = "Unclaimed: just walk in"; return end
@@ -468,6 +547,11 @@ end
 local function proposePeace()
   if not player then msgText = "Observer mode"; return end
   if not selected then msgText = "Select enemy province"; return end
+  if net.role == "client" then
+    sendNetAction("peace", { target = selected })
+    msgText = "Peace request sent to host"
+    return
+  end
   local t = provinces[selected].owner
   if t == player or cmap[t].neutral or not atWar(player, t) then
     msgText = "Not at war with them"
@@ -521,6 +605,16 @@ local function inWar(id)
   return false
 end
 
+local function isHumanCountry(id)
+  if id == player then return true end
+  if net.role == "host" and net.started then
+    for _, peer in pairs(net.peers) do
+      if peer.country == id then return true end
+    end
+  end
+  return false
+end
+
 local function aiTick(id)
   local idle, foes, mine = {}, {}, 0
   for _, d in ipairs(divisions) do
@@ -541,7 +635,7 @@ local function aiTick(id)
     local a, b = key:match("^(.-)|(.+)$")
     if a == id or b == id then
       local other = (a == id) and b or a
-      if other ~= player then
+      if not isHumanCountry(other) then
         local age = dayCount - (warStart[key] or dayCount)
         local theirs = 0
         for _, d in ipairs(divisions) do
@@ -717,9 +811,9 @@ local function economyAndAI()
         pp[id] = pp[id] + (income[id] or 0) * (1 + bonus(id, "pp"))
         if tech[id] then
           tech[id].rp = tech[id].rp + researchRate(id)
-          if id ~= player then aiResearch(id) end
+          if not isHumanCountry(id) then aiResearch(id) end
         end
-        local auto = (id ~= player) or val("auto") == 1
+        local auto = not isHumanCountry(id) or (id == player and val("auto") == 1)
         if auto and pp[id] >= divCost(id) and (cnt[id] or 0) < divCap(id) then
           local at = capitalOf(id)
           if at then
@@ -743,7 +837,7 @@ local function economyAndAI()
   for _ = 1, 2 do
     aiIdx = aiIdx % #countryIds + 1
     local id = countryIds[aiIdx]
-    if id ~= player and not cmap[id].neutral and not dead[id] then aiTick(id) end
+    if not isHumanCountry(id) and not cmap[id].neutral and not dead[id] then aiTick(id) end
   end
 end
 
@@ -751,6 +845,11 @@ local function recruit()
   if not player then msgText = "Observer mode"; return end
   local at = (selected and provinces[selected].owner == player) and selected or capitalOf(player)
   if not at then msgText = "No province to recruit in"; return end
+  if net.role == "client" then
+    sendNetAction("recruit", { province = at })
+    msgText = "Recruit request sent to host"
+    return
+  end
   local cost = divCost(player)
   if pp[player] < cost then
     msgText = string.format("Need %d PP (have %d)", cost, math.floor(pp[player]))
@@ -774,6 +873,11 @@ local function buySpecialUnit(kind)
   if not cost then buildMsg = "Unknown unit"; return end
   local at = (selected and provinces[selected].owner == player) and selected or capitalOf(player)
   if not at then buildMsg = "No province to deploy in"; return end
+  if net.role == "client" then
+    sendNetAction("build", { unit = kind, province = at })
+    buildMsg = "Production request sent to host"
+    return
+  end
   if kind == "navy" and not provinces[at].coast then
     buildMsg = "Fleet requires a coastal province"
     return
@@ -809,6 +913,7 @@ local function newGame()
   dayCount, aiIdx = 0, 0
   date.y, date.m, date.d = 1936, 1, 1
   selected = nil
+  moveTypeIndex = 1
   speed = val("speed")
   paused = true
   timerId = nil
@@ -863,6 +968,7 @@ local function loadGame()
   end
   player = (data.player and cmap[data.player]) and data.player or nil
   selected, mode, msgText = nil, nil, "Game loaded"
+  moveTypeIndex = 1
   paused, timerId = true, nil
   speed = val("speed")
   zi = 2
@@ -870,6 +976,303 @@ local function loadGame()
   vx, vy = WW / 2 - vw / 2, WH / 2 - vh / 2
   dirty = true
   return true
+end
+
+local function makeNetSnapshot()
+  local owners = {}
+  for i, p in ipairs(provinces) do owners[i] = p.owner end
+  return {
+    owners = owners, divisions = divisions, wars = wars, truces = truces, warStart = warStart,
+    pp = pp, dead = dead, lastWar = lastWar, tech = tech, logLines = logLines,
+    dayCount = dayCount, aiIdx = aiIdx, date = { y = date.y, m = date.m, d = date.d },
+    speed = speed, paused = paused,
+  }
+end
+
+local function applyNetSnapshot(s)
+  if type(s) ~= "table" or type(s.owners) ~= "table" or #s.owners ~= #provinces
+      or type(s.divisions) ~= "table" or #s.divisions > 5000 or type(s.date) ~= "table"
+      or type(s.pp) ~= "table" or type(s.wars) ~= "table" then return false end
+  for i, owner in ipairs(s.owners) do
+    if not cmap[owner] then return false end
+  end
+  for _, d in ipairs(s.divisions) do
+    if type(d) ~= "table" or not cmap[d.owner] or not provinces[d.prov]
+        or (d.to and not provinces[d.to]) or type(d.str) ~= "number" then return false end
+  end
+  for i, p in ipairs(provinces) do p.owner = s.owners[i] end
+  divisions = s.divisions
+  wars, truces, warStart = s.wars, s.truces or {}, s.warStart or {}
+  pp, dead, lastWar = s.pp, s.dead or {}, s.lastWar or {}
+  tech, logLines = s.tech or {}, s.logLines or {}
+  date.y, date.m, date.d = s.date.y, s.date.m, s.date.d
+  dayCount, aiIdx = s.dayCount or 0, s.aiIdx or 0
+  speed = math.max(1, math.min(#SPEEDS, tonumber(s.speed) or speed))
+  paused = s.paused ~= false
+  battles = {}
+  dirty = true
+  return true
+end
+
+local function sendNetSnapshot(recipient)
+  if net.role ~= "host" or not net.started then return end
+  local packet = { v = 1, kind = "snapshot", session = net.session, state = makeNetSnapshot() }
+  if recipient then
+    rednet.send(recipient, packet, NET_PROTOCOL)
+  else
+    for id in pairs(net.peers) do rednet.send(id, packet, NET_PROTOCOL) end
+  end
+end
+
+local function lobbyMembers()
+  local list = { { id = os.getComputerID(), name = net.name, country = net.country, ready = net.hostReady } }
+  for id, p in pairs(net.peers or {}) do
+    list[#list + 1] = { id = id, name = p.name, country = p.country, ready = p.ready }
+  end
+  table.sort(list, function(a, b) return a.id < b.id end)
+  return list
+end
+
+local function sendLobbyUpdate(recipient)
+  if net.role ~= "host" then return end
+  local packet = {
+    v = 1, kind = "lobby", code = net.code, session = net.session,
+    members = lobbyMembers(), settings = cloneSettings(),
+  }
+  if recipient then rednet.send(recipient, packet, NET_PROTOCOL)
+  else
+    for id in pairs(net.peers) do rednet.send(id, packet, NET_PROTOCOL) end
+  end
+end
+
+local function allLobbyReady()
+  if net.role ~= "host" or not net.hostReady then return false end
+  local count = 0
+  for _, peer in pairs(net.peers) do
+    count = count + 1
+    if not peer.ready then return false end
+  end
+  return count > 0
+end
+
+local function startLobbyGame()
+  if not allLobbyReady() then
+    menuMsg = "Need at least 2 players; everyone must be READY"
+    return false
+  end
+  newGame()
+  net.started = true
+  gameStarted, inMenu, menuPage = true, false, "main"
+  local packet = {
+    v = 1, kind = "start", session = net.session,
+    country = net.country, settings = cloneSettings(), state = makeNetSnapshot(),
+  }
+  for id in pairs(net.peers) do rednet.send(id, packet, NET_PROTOCOL) end
+  return true
+end
+
+local function openHostLobby(password)
+  local ok, why = openLobbyNetwork()
+  if not ok then menuMsg = why; return false end
+  menuMsg = ""
+  local id = os.getComputerID()
+  net = {
+    role = "host", id = id, name = (os.getComputerLabel() or ("Host " .. id)):sub(1, 16),
+    code = lobbyCode(), session = lobbyCode() .. tostring(os.epoch("utc")),
+    password = password or "", country = playable[settings.country], peers = {}, hostReady = false,
+    started = false, settingsCursor = 1,
+  }
+  settings.observer = false
+  menuPage, inMenu = "lobby", true
+  return true
+end
+
+local function beginLobbyScan()
+  local ok, why = openLobbyNetwork()
+  if not ok then menuMsg = why; return false end
+  lobbyBrowser, selectedLobby = {}, nil
+  lobbyBrowserPage = 1
+  menuMsg = "Searching for lobbies..."
+  rednet.broadcast({ v = 1, kind = "discover", mapKey = MAP_KEY }, NET_PROTOCOL)
+  if browserScanTimer then os.cancelTimer(browserScanTimer) end
+  browserScanTimer = os.startTimer(2)
+  return true
+end
+
+local function requestLobbyJoin(room, password)
+  local ok, why = openLobbyNetwork()
+  if not ok then menuMsg = why; return false end
+  net = {
+    role = "client", id = os.getComputerID(), host = room.host, name = os.getComputerLabel()
+      or ("Player " .. os.getComputerID()), code = room.code, session = room.session,
+    joinPassword = password or "",
+  }
+  rednet.send(room.host, {
+    v = 1, kind = "join", code = room.code, password = password or "",
+    name = net.name:sub(1, 16), mapKey = MAP_KEY,
+  }, NET_PROTOCOL)
+  if joinTimer then os.cancelTimer(joinTimer) end
+  joinTimer = os.startTimer(8)
+  menuMsg = "Joining " .. room.name .. "..."
+  menuPage = "joining"
+  return true
+end
+
+local function validIndex(i, max)
+  return type(i) == "number" and i == math.floor(i) and i >= 1 and i <= max
+end
+
+local function handleClientAction(sender, packet)
+  local peer = net.peers[sender]
+  if not net.started or not peer or packet.session ~= net.session
+      or not validIndex(packet.seq, 2147483647) or packet.seq <= (peer.lastSeq or 0)
+      or type(packet.action) ~= "string" or type(packet.data) ~= "table" then return end
+  peer.lastSeq = packet.seq
+  local data, oldPlayer, oldSelected = packet.data, player, selected
+  player, selected = peer.country, nil
+  if packet.action == "move" and validIndex(data.from, #provinces) and validIndex(data.to, #provinces)
+      and type(data.all) == "boolean"
+      and (data.kind == "all" or data.kind == "land" or data.kind == "air" or data.kind == "navy")
+      and provinces[data.from].owner == peer.country then
+    issueMove(data.from, data.to, data.all, data.kind)
+  elseif packet.action == "recruit" and validIndex(data.province, #provinces)
+      and provinces[data.province].owner == peer.country then
+    selected = data.province
+    recruit()
+  elseif packet.action == "build" and validIndex(data.province, #provinces)
+      and provinces[data.province].owner == peer.country
+      and (data.unit == "air" or data.unit == "navy") then
+    selected = data.province
+    buySpecialUnit(data.unit)
+  elseif packet.action == "war" and validIndex(data.target, #provinces) then
+    selected = data.target
+    declareWar()
+  elseif packet.action == "peace" and validIndex(data.target, #provinces) then
+    selected = data.target
+    proposePeace()
+  elseif packet.action == "tech" and type(data.id) == "string" and #data.id <= 12 then
+    techMsg = buyTech(peer.country, data.id)
+  elseif packet.action == "lobby_sync" then
+    player, selected = oldPlayer, oldSelected
+    sendNetSnapshot(sender)
+    return
+  end
+  player, selected = oldPlayer, oldSelected
+  sendNetSnapshot()
+  rednet.send(sender, { v = 1, kind = "status", session = net.session, text = msgText:sub(1, 80) }, NET_PROTOCOL)
+end
+
+local function handleNetMessage(sender, packet)
+  if type(packet) ~= "table" or packet.v ~= 1 or type(packet.kind) ~= "string" then return end
+  if menuPage == "browser" and packet.kind == "lobby_info" and type(packet.code) == "string"
+      and #packet.code == 6 and packet.code:match("^[A-HJ-NP-Z2-9]+$")
+      and type(packet.session) == "string" and type(packet.name) == "string"
+      and type(packet.players) == "number" and type(packet.maxPlayers) == "number"
+      and type(packet.hasPassword) == "boolean" and type(packet.mapKey) == "string" then
+    local room
+    for _, found in ipairs(lobbyBrowser) do
+      if found.host == sender and found.session == packet.session then room = found; break end
+    end
+    if not room then
+      room = { host = sender, session = packet.session }
+      lobbyBrowser[#lobbyBrowser + 1] = room
+    end
+    room.code, room.name = packet.code, packet.name:sub(1, 24)
+    room.players = math.max(1, math.min(#playable, math.floor(packet.players)))
+    room.maxPlayers = math.max(1, math.min(#playable, math.floor(packet.maxPlayers)))
+    room.hasPassword, room.mapKey = packet.hasPassword, packet.mapKey
+    table.sort(lobbyBrowser, function(a, b)
+      if a.name == b.name then return a.code < b.code end
+      return a.name < b.name
+    end)
+  elseif net.role == "host" and not net.started then
+    if packet.kind == "discover" and sender ~= net.id then
+      rednet.send(sender, {
+        v = 1, kind = "lobby_info", code = net.code, session = net.session,
+        name = net.name, players = 1 + (function()
+          local n = 0
+          for _ in pairs(net.peers) do n = n + 1 end
+          return n
+        end)(),
+        maxPlayers = #playable, hasPassword = net.password ~= "", mapKey = MAP_KEY,
+      }, NET_PROTOCOL)
+    elseif packet.kind == "join" and packet.code == net.code and sender ~= net.id
+        and type(packet.password) == "string" and #packet.password <= 12
+        and packet.password:match("^%d*$") and type(packet.name) == "string"
+        and packet.mapKey == MAP_KEY then
+      local peer = net.peers[sender]
+      if not peer then
+        local used = { [net.country] = true }
+        for _, p in pairs(net.peers) do used[p.country] = true end
+        local country
+        for _, id in ipairs(playable) do if not used[id] then country = id; break end end
+        if not country or packet.password ~= net.password or #packet.name < 1 then
+          rednet.send(sender, {
+            v = 1, kind = "reject", code = net.code, session = net.session,
+            reason = not country and "Lobby is full" or "Password rejected",
+          }, NET_PROTOCOL)
+          return
+        end
+        peer = { name = packet.name:sub(1, 16), country = country, ready = false, lastSeq = 0 }
+        net.peers[sender] = peer
+      end
+      rednet.send(sender, {
+        v = 1, kind = "joined", code = net.code, session = net.session,
+        country = peer.country, settings = cloneSettings(), mapKey = MAP_KEY,
+      }, NET_PROTOCOL)
+      sendLobbyUpdate()
+    elseif packet.kind == "ready" and packet.session == net.session and net.peers[sender]
+        and type(packet.ready) == "boolean" then
+      net.peers[sender].ready = packet.ready
+      sendLobbyUpdate()
+      if allLobbyReady() then startLobbyGame() end
+    elseif packet.kind == "leave" and packet.session == net.session then
+      net.peers[sender] = nil
+      sendLobbyUpdate()
+    end
+  elseif net.role == "host" and net.started and packet.kind == "leave"
+      and packet.session == net.session and net.peers[sender] then
+    net.peers[sender] = nil
+    sendNetSnapshot()
+  elseif net.role == "host" and packet.kind == "action" then
+    handleClientAction(sender, packet)
+  elseif net.role == "client" and sender == net.host and packet.session == net.session then
+    if packet.kind == "joined" and packet.code == net.code and cmap[packet.country]
+        and packet.mapKey == MAP_KEY then
+      if joinTimer then os.cancelTimer(joinTimer); joinTimer = nil end
+      net.country, net.settings = packet.country, packet.settings
+      net.ready, net.members, net.joinPassword = false, {}, nil
+      netSeq = 0
+      menuPage, inMenu, menuMsg = "lobby", true, ""
+    elseif packet.kind == "lobby" and inMenu and type(packet.members) == "table" then
+      net.members, net.settings = packet.members, packet.settings
+    elseif packet.kind == "start" and inMenu and cmap[packet.country] and type(packet.settings) == "table" then
+      net.country = packet.country
+      for _, o in ipairs(OPTS) do
+        if type(packet.settings[o.key]) == "number" and o.num[packet.settings[o.key]] then
+          settings[o.key] = packet.settings[o.key]
+        end
+      end
+      for i, id in ipairs(playable) do if id == net.country then settings.country = i; break end end
+      newGame()
+      player = net.country
+      net.started = true
+      gameStarted, inMenu = true, false
+      applyNetSnapshot(packet.state)
+    elseif packet.kind == "snapshot" and net.started then
+      applyNetSnapshot(packet.state)
+    elseif packet.kind == "status" and type(packet.text) == "string" then
+      msgText = packet.text:sub(1, 80)
+    elseif packet.kind == "closed" then
+      net = { role = "single" }
+      inMenu, menuPage, menuMsg = true, "main", "Host closed the lobby"
+    elseif packet.kind == "reject" then
+      if joinTimer then os.cancelTimer(joinTimer); joinTimer = nil end
+      net = { role = "single" }
+      inMenu, menuPage = true, "browser"
+      menuMsg = type(packet.reason) == "string" and packet.reason or "Could not join lobby"
+    end
+  end
 end
 
 local function advanceDay()
@@ -1041,14 +1444,44 @@ local function drawMap()
     end
   end
 
-  -- маркеры дивизий: число, ">" если идут, "!" если бой
+  -- маршруты уже идущих дивизий: точки показывают путь, X — пункт назначения
+  for _, d in ipairs(divisions) do
+    if d.to then
+      local from, to = provinces[d.prov], provinces[d.to]
+      local x1 = math.floor((from.cx - 0.5 - vx) * z) + 1
+      local y1 = math.floor((from.cy - 0.5 - vy) * z) + 1
+      local x2 = math.floor((to.cx - 0.5 - vx) * z) + 1
+      local y2 = math.floor((to.cy - 0.5 - vy) * z) + 1
+      local dx, dy = math.abs(x2 - x1), math.abs(y2 - y1)
+      local sx, sy = x1 < x2 and 1 or -1, y1 < y2 and 1 or -1
+      local err = dx - dy
+      local step = 0
+      while x1 ~= x2 or y1 ~= y2 do
+        local twice = 2 * err
+        if twice > -dy then err, x1 = err - dy, x1 + sx end
+        if twice < dx then err, y1 = err + dx, y1 + sy end
+        step = step + 1
+        if step % 2 == 0 and (x1 ~= x2 or y1 ~= y2)
+            and x1 >= 1 and x1 <= mapW and y1 >= 1 and y1 <= mapH then
+          rows[y1].ch[x1] = "."
+          rows[y1].fg[x1] = colors.white
+        end
+      end
+      if x2 >= 1 and x2 <= mapW and y2 >= 1 and y2 <= mapH then
+        rows[y2].ch[x2] = "X"
+        rows[y2].fg[x2] = colors.white
+      end
+    end
+  end
+
+  -- маркеры дивизий: L = land, A = air, N = navy
   local byProv = {}
   for _, d in ipairs(divisions) do
     local g = byProv[d.prov]
     if not g then g = {}; byProv[d.prov] = g end
     local e = g[d.owner]
-    if not e then e = { n = 0, mov = false }; g[d.owner] = e end
-    e.n = e.n + 1
+    if not e then e = { land = 0, air = 0, navy = 0, mov = false }; g[d.owner] = e end
+    e[d.kind or "land"] = e[d.kind or "land"] + 1
     if d.to then e.mov = true end
   end
   for pi, groups in pairs(byProv) do
@@ -1061,7 +1494,10 @@ local function drawMap()
       for _, id in ipairs(countryIds) do
         local e = groups[id]
         if e then
-          local txt = " " .. e.n .. (e.mov and ">" or "") .. (battles[pi] and "!" or "") .. " "
+          local txt = " " .. (e.land > 0 and ("L" .. e.land) or "")
+            .. (e.air > 0 and ("A" .. e.air) or "")
+            .. (e.navy > 0 and ("N" .. e.navy) or "")
+            .. (e.mov and ">" or "") .. (battles[pi] and "!" or "") .. " "
           chips[#chips + 1] = { txt = txt, id = id }
           total = total + #txt
         end
@@ -1173,13 +1609,14 @@ local function drawPanel()
       if l.sea then seaN = seaN + 1 end
     end
     put(x0 + 1, y, "Borders:  " .. #p.nb .. (seaN > 0 and (" +" .. seaN .. " sea") or ""), colors.white); y = y + 1
-    local mine, foe = 0, 0
+    local mine, foe = { land = 0, air = 0, navy = 0 }, 0
     for _, d in ipairs(divisions) do
       if d.prov == selected then
-        if d.owner == player then mine = mine + 1 else foe = foe + 1 end
+        if d.owner == player then mine[d.kind or "land"] = mine[d.kind or "land"] + 1 else foe = foe + 1 end
       end
     end
-    put(x0 + 1, y, "Troops:   " .. mine .. " yours / " .. foe .. " other", colors.white)
+    put(x0 + 1, y, string.format("Units L%d A%d N%d O%d",
+      mine.land, mine.air, mine.navy, foe), colors.white)
   else
     put(x0 + 1, y, "(tap a province)", colors.lightGray)
   end
@@ -1207,7 +1644,7 @@ local function drawPanel()
     put(x0 + 1, y, "  ", colors.white, c.color)
     put(x0 + 4, y, string.format("%-9s %2d prov %s", c.name, counts[id] or 0, tag),
       id == player and colors.lightBlue or colors.white)
-    if not c.neutral then buttons[#buttons + 1] = { x1 = x0 + 1, x2 = x0 + PANEL_W - 1, y1 = y, y2 = y, fn = function()
+    if not c.neutral and net.role == "single" then buttons[#buttons + 1] = { x1 = x0 + 1, x2 = x0 + PANEL_W - 1, y1 = y, y2 = y, fn = function()
       player = id
       msgText = "Now playing " .. c.name
       return true
@@ -1218,10 +1655,12 @@ local function drawPanel()
   -- приказы
   local oy = y + 1
   local function moveBtn(label, x, w, all)
-    btn(label, x, oy, w, 3, (mode and mode.all == all) and colors.white or colors.lightGray, function()
+    btn(label, x, oy, w, 3, (mode and mode.all == all and mode.kind == MOVE_TYPES[moveTypeIndex])
+      and colors.white or colors.lightGray, function()
       if selected then
-        mode = { all = all }
-        msgText = "Tap a neighbor province"
+        local kind = MOVE_TYPES[moveTypeIndex]
+        mode = { all = all, kind = kind }
+        msgText = "Tap destination: " .. MOVE_LABELS[kind]
       else
         msgText = "Select a province first"
       end
@@ -1229,13 +1668,17 @@ local function drawPanel()
     end)
   end
   if player then
-    moveBtn("MOVE ALL", bx, 10, true)
-    moveBtn("MOVE 1", bx + 11, 9, false)
-    btn("WAR", bx + 21, oy, 6, 3, colors.lightGray, function() declareWar(); return true end)
+    moveBtn("ALL", bx, 6, true)
+    moveBtn("ONE", bx + 7, 6, false)
+    btn("TYPE " .. MOVE_LABELS[MOVE_TYPES[moveTypeIndex]], bx + 14, oy, 9, 3, colors.lightGray, function()
+      moveTypeIndex = moveTypeIndex % #MOVE_TYPES + 1
+      return false
+    end)
+    btn("WAR", bx + 24, oy, 5, 3, colors.lightGray, function() declareWar(); return true end)
     btn("RECRUIT", bx, oy + 4, 12, 3, colors.lightGray, function() recruit(); return true end)
     btn("PEACE", bx + 13, oy + 4, 8, 3, colors.lightGray, function() proposePeace(); return true end)
     btn("BUILD", bx + 22, oy + 4, 6, 3, colors.lightGray, function() enterBuild(); return false end)
-    put(x0 + 1, oy + 7, "RECRUIT: " .. divCost(player) .. " PP | cap grows with land", colors.lightGray)
+    put(x0 + 1, oy + 7, "L/A/N units  . route  X goal", colors.lightGray)
   end
 
   put(x0 + 1, oy + 8, msgText:sub(1, PANEL_W - 2), colors.white)
@@ -1247,17 +1690,21 @@ local function drawPanel()
 
   -- время
   local ty = H - 18
-  btn(paused and "PLAY" or "PAUSE", bx, ty, 9, 3, paused and colors.white or colors.lightGray, function()
-    paused = not paused
-    timerId = nil
-    restartTimer()
+  btn(net.role == "client" and "HOST" or (paused and "PLAY" or "PAUSE"), bx, ty, 9, 3,
+    net.role == "client" and colors.gray or (paused and colors.white or colors.lightGray), function()
+      if net.role == "client" then return false end
+      paused = not paused
+      timerId = nil
+      restartTimer()
+      return false
+    end)
+  btn("-", bx + 10, ty, 5, 3, net.role == "client" and colors.gray or colors.lightGray, function()
+    if net.role ~= "client" then speed = math.max(1, speed - 1); restartTimer() end
     return false
   end)
-  btn("-", bx + 10, ty, 5, 3, colors.lightGray, function()
-    speed = math.max(1, speed - 1); restartTimer(); return false
-  end)
-  btn("+", bx + 16, ty, 5, 3, colors.lightGray, function()
-    speed = math.min(#SPEEDS, speed + 1); restartTimer(); return false
+  btn("+", bx + 16, ty, 5, 3, net.role == "client" and colors.gray or colors.lightGray, function()
+    if net.role ~= "client" then speed = math.min(#SPEEDS, speed + 1); restartTimer() end
+    return false
   end)
   btn("MENU", bx + 22, ty, 6, 3, colors.lightGray, function() enterMenu(); return false end)
 
@@ -1342,7 +1789,7 @@ local function onTouch(x, y)
       local m = mode
       mode = nil
       if p ~= 0 and p ~= selected then
-        issueMove(selected, p, m.all)
+        issueMove(selected, p, m.all, m.kind)
       else
         msgText = "Cancelled"
       end
@@ -1459,12 +1906,13 @@ local function drawBuildScreen()
   local bw = math.min(52, W - 4)
   local x0 = math.max(2, math.floor((W - bw) / 2) + 1)
   for r = 0, 2 do put(x0, 3 + r, string.rep(" ", bw), colors.black, colors.white) end
-  put(x0 + 2, 4, ("ARMY PRODUCTION  -  " .. cmap[player].name):sub(1, bw - 4), colors.black, colors.white)
-  put(x0, 8, string.format("PP %d | divisions %d/%d", math.floor(pp[player]), (function()
-    local n = 0
-    for _, d in ipairs(divisions) do if d.owner == player then n = n + 1 end end
-    return n
-  end)(), divCap(player)), colors.lightGray)
+  put(x0 + 2, 4, ("UNIT PRODUCTION  -  " .. cmap[player].name):sub(1, bw - 4), colors.black, colors.white)
+  local count = { land = 0, air = 0, navy = 0 }
+  for _, d in ipairs(divisions) do
+    if d.owner == player then count[d.kind or "land"] = count[d.kind or "land"] + 1 end
+  end
+  put(x0, 8, string.format("PP %d | L%d A%d N%d / %d",
+    math.floor(pp[player]), count.land, count.air, count.navy, divCap(player)), colors.lightGray)
   put(x0, 10, "Deploy in selected own province, otherwise in capital.", colors.lightGray)
   btn("BUY AIR DIVISION  -  300 PP  (strong attack)", x0, 13, bw, 4, colors.lightGray, function()
     buySpecialUnit("air")
@@ -1656,13 +2104,21 @@ local function drawMainPage()
   local x0 = mx()
   title("H O I - C C")
   put(x0 + 2, 7, "Strategy for ComputerCraft  -  server world", colors.lightGray)
+  btn("SINGLEPLAYER", x0, 13, MW, 5, colors.white, function()
+    menuPage, menuMsg = "single", ""
+    return true
+  end)
+  btn("MULTIPLAYER", x0, 21, MW, 5, colors.lightGray, function()
+    menuPage, menuMsg = "multi", ""
+    return true
+  end)
+  btn("QUIT", x0, 42, MW, 3, colors.lightGray, function() quit = true; return false end)
+  put(x0, 39, menuMsg:sub(1, MW), colors.white)
+end
 
-  put(x0, 9, "MODE", colors.lightBlue)
-  btn("PLAY", x0, 10, 25, 3, settings.observer and colors.lightGray or colors.white,
-    function() settings.observer = false; return true end)
-  btn("OBSERVER", x0 + 27, 10, 25, 3, settings.observer and colors.white or colors.lightGray,
-    function() settings.observer = true; return true end)
-
+local function drawSinglePage()
+  local x0 = mx()
+  title("SINGLEPLAYER")
   local id = playable[settings.country]
   local c = cmap[id]
   local n = 0
@@ -1681,9 +2137,13 @@ local function drawMainPage()
     redrawAll()
     return false
   end)
-  btn("SETTINGS", x0, 26, 25, 3, colors.lightGray, function() menuPage = "settings"; return true end)
+  btn("SETTINGS", x0, 26, 25, 3, colors.lightGray, function()
+    menuReturnPage, menuPage = "single", "settings"
+    return true
+  end)
   btn("CREATE COUNTRY", x0 + 27, 26, 25, 3, colors.lightGray, function()
-    menuPage = "create"; createMsg = ""; return true
+    menuReturnPage, menuPage, createMsg = "single", "create", ""
+    return true
   end)
   if gameStarted then
     btn("SAVE GAME", x0, 30, 25, 3, colors.lightGray, function()
@@ -1711,9 +2171,121 @@ local function drawMainPage()
       return false
     end)
   end
-  btn("QUIT", x0, 38, MW, 3, colors.lightGray, function() quit = true; return false end)
-  put(x0, 42, menuMsg:sub(1, MW), colors.white)
-  put(x0, 44, "Tap the buttons on the monitor. Q on the computer also quits.", colors.lightGray)
+  btn("BACK", x0, 42, MW, 3, colors.lightGray, function() menuPage = "main"; return true end)
+  put(x0, 46, "Tap buttons on the monitor. Q on the computer quits.", colors.lightGray)
+end
+
+local function drawMultiPage()
+  local x0 = mx()
+  title("MULTIPLAYER")
+  local id = playable[settings.country]
+  local country = cmap[id]
+  selector("HOST COUNTRY", 8, country.name, country.color, country.fg,
+    function() settings.country = (settings.country - 2) % #playable + 1; return true end,
+    function() settings.country = settings.country % #playable + 1; return true end)
+  btn("CREATE GAME", x0, 16, MW, 5, colors.white, function()
+    passwordInput, passwordPurpose = "", "host"
+    menuPage = "password"
+    return true
+  end)
+  btn("LOBBY BROWSER", x0, 24, MW, 5, colors.lightGray, function()
+    menuPage = "browser"
+    beginLobbyScan()
+    return true
+  end)
+  btn("BACK", x0, 42, MW, 3, colors.lightGray, function() menuPage = "main"; return true end)
+  put(x0, 39, menuMsg:sub(1, MW), colors.white)
+end
+
+local function drawLobbyBrowserPage()
+  local x0 = mx()
+  title("LOBBY BROWSER")
+  local pages = math.max(1, math.ceil(#lobbyBrowser / 7))
+  lobbyBrowserPage = math.max(1, math.min(pages, lobbyBrowserPage))
+  put(x0, 8, string.format("LOBBIES: %d  PAGE %d/%d", #lobbyBrowser, lobbyBrowserPage, pages), colors.lightBlue)
+  local first = (lobbyBrowserPage - 1) * 7 + 1
+  for i = first, math.min(first + 6, #lobbyBrowser) do
+    local room = lobbyBrowser[i]
+    local label = string.format("%-14s %d/%d #%s %s",
+      room.name:sub(1, 14), room.players, room.maxPlayers, room.code, room.hasPassword and "LOCK" or "OPEN")
+    local selected = room
+    btn(label:sub(1, MW), x0, 10 + (i - first) * 4, MW, 3,
+      room.mapKey == MAP_KEY and colors.lightGray or colors.gray, function()
+        if selected.mapKey ~= MAP_KEY then
+          menuMsg = "This lobby uses a different map"
+          return true
+        end
+        if selected.hasPassword then
+          selectedLobby = selected
+          passwordInput, passwordPurpose = "", "join"
+          menuPage = "password"
+        else
+          requestLobbyJoin(selected, "")
+        end
+        return true
+      end)
+  end
+  local status = menuMsg
+  if #lobbyBrowser == 0 and not browserScanTimer and status == "" then status = "No lobbies found; tap REFRESH" end
+  put(x0, 38, status:sub(1, MW), colors.white)
+  if lobbyBrowserPage > 1 then
+    btn("PREV", x0, 40, 25, 3, colors.lightGray, function()
+      lobbyBrowserPage = lobbyBrowserPage - 1
+      return true
+    end)
+  end
+  if lobbyBrowserPage < pages then
+    btn("NEXT", x0 + 27, 40, 25, 3, colors.lightGray, function()
+      lobbyBrowserPage = lobbyBrowserPage + 1
+      return true
+    end)
+  end
+  btn("REFRESH", x0, 45, 25, 3, colors.lightGray, function()
+    beginLobbyScan()
+    return true
+  end)
+  btn("BACK", x0 + 27, 45, 25, 3, colors.lightGray, function()
+    if browserScanTimer then os.cancelTimer(browserScanTimer); browserScanTimer = nil end
+    menuPage = "multi"
+    return true
+  end)
+end
+
+local function drawPasswordPage()
+  local x0 = mx()
+  title(passwordPurpose == "host" and "LOBBY PASSWORD" or "ENTER PASSWORD")
+  put(x0, 8, passwordPurpose == "host" and "Digits only, max 12; blank = public lobby" or
+    ("Password for #" .. (selectedLobby and selectedLobby.code or "")), colors.lightGray)
+  put(x0, 10, "PASSWORD: " .. string.rep("*", #passwordInput), colors.white)
+  put(x0, 11, "Warning: Rednet does not encrypt this password", colors.gray)
+  local keysLayout = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "DEL", "0", "CLEAR" }
+  for i, key in ipairs(keysLayout) do
+    local col, row = (i - 1) % 3, math.floor((i - 1) / 3)
+    local w, gap = 16, 1
+    local x = x0 + col * (w + gap)
+    local y = 13 + row * 4
+    btn(key, x, y, w, 3, colors.lightGray, function()
+      if key == "DEL" then passwordInput = passwordInput:sub(1, -2)
+      elseif key == "CLEAR" then passwordInput = ""
+      elseif #passwordInput < 12 then passwordInput = passwordInput .. key end
+      return true
+    end)
+  end
+  put(x0, 29, menuMsg:sub(1, MW), colors.white)
+  btn("CONTINUE", x0, 31, 25, 4, colors.white, function()
+    if passwordPurpose == "host" then
+      openHostLobby(passwordInput)
+    elseif selectedLobby then
+      requestLobbyJoin(selectedLobby, passwordInput)
+    end
+    return true
+  end)
+  btn("CANCEL", x0 + 27, 31, 25, 4, colors.lightGray, function()
+    passwordInput = ""
+    menuPage = passwordPurpose == "join" and "browser" or "multi"
+    passwordPurpose = nil
+    return true
+  end)
 end
 
 local function drawSettingsPage()
@@ -1726,8 +2298,112 @@ local function drawSettingsPage()
       function() settings[o.key] = settings[o.key] % #o.vals + 1; return true end)
     y = y + 4
   end
-  btn("BACK", x0, y + 1, MW, 3, colors.lightGray, function() menuPage = "main"; return true end)
+  btn("BACK", x0, y + 1, MW, 3, colors.lightGray, function()
+    menuPage = menuReturnPage
+    return true
+  end)
   put(x0, y + 5, "Changes apply to the next NEW GAME (AI, income, events apply at once).", colors.lightGray)
+end
+
+local function cycleLobbySetting(step)
+  if net.role ~= "host" or not net.peers then return end
+  local option = OPTS[net.settingsCursor]
+  if not option then return end
+  settings[option.key] = (settings[option.key] - 1 + step) % #option.vals + 1
+  net.hostReady = false
+  for _, peer in pairs(net.peers) do peer.ready = false end
+  sendLobbyUpdate()
+end
+
+local function leaveLobby()
+  if net.role == "client" and net.host then
+    rednet.send(net.host, { v = 1, kind = "leave", session = net.session }, NET_PROTOCOL)
+  elseif net.role == "host" then
+    for id in pairs(net.peers) do
+      rednet.send(id, { v = 1, kind = "closed", session = net.session }, NET_PROTOCOL)
+    end
+  end
+  net = { role = "single" }
+  menuPage, inMenu, menuMsg = "main", true, ""
+end
+
+local function drawLobbyPage()
+  local x0 = mx()
+  title(net.role == "host" and "HOST LOBBY" or "JOINED LOBBY")
+  put(x0, 8, "LOBBY CODE: " .. tostring(net.code), colors.white)
+  put(x0, 10, net.password and net.password ~= "" and "Password: set (not encrypted)" or "Password: none",
+    colors.lightGray)
+
+  local members = net.role == "host" and lobbyMembers() or (net.members or {})
+  put(x0, 12, string.format("PLAYERS %d/%d", #members, #playable), colors.lightBlue)
+  for i = 1, math.min(8, #members) do
+    local member = members[i]
+    local country = cmap[member.country]
+    local line = string.format("%s  %s  %s",
+      member.name or "Player", country and country.name or "?", member.ready and "READY" or "WAIT")
+    put(x0, 12 + i, line:sub(1, MW), member.ready and colors.lime or colors.white)
+  end
+  if #members > 8 then put(x0, 21, "and " .. (#members - 8) .. " more", colors.lightGray) end
+
+  if net.role == "host" then
+    local option = OPTS[net.settingsCursor]
+    put(x0, 23, "HOST SETTINGS (change resets READY)", colors.lightBlue)
+    if option then
+      put(x0, 25, option.label:sub(1, MW), colors.white)
+      btn("<", x0, 26, 12, 3, colors.lightGray, function()
+        cycleLobbySetting(-1); return true
+      end)
+      local value = option.vals[settings[option.key]]
+      put(x0 + 13, 27, value:sub(1, MW - 26), colors.white)
+      btn(">", x0 + MW - 12, 26, 12, 3, colors.lightGray, function()
+        cycleLobbySetting(1); return true
+      end)
+      btn("SETTING -", x0, 30, 25, 3, colors.lightGray, function()
+        net.settingsCursor = (net.settingsCursor - 2) % #OPTS + 1
+        return true
+      end)
+      btn("SETTING +", x0 + 27, 30, 25, 3, colors.lightGray, function()
+        net.settingsCursor = net.settingsCursor % #OPTS + 1
+        return true
+      end)
+    end
+    btn(net.hostReady and "NOT READY" or "READY", x0, 35, 25, 3, colors.white, function()
+      net.hostReady = not net.hostReady
+      sendLobbyUpdate()
+      if allLobbyReady() then startLobbyGame() end
+      return true
+    end)
+    btn("START WHEN READY", x0 + 27, 35, 25, 3, colors.lightGray, function()
+      startLobbyGame()
+      return true
+    end)
+  else
+    put(x0, 23, "Host controls game settings.", colors.lightGray)
+    btn(net.ready and "NOT READY" or "READY", x0, 35, 25, 3, colors.white, function()
+      net.ready = not net.ready
+      rednet.send(net.host, { v = 1, kind = "ready", session = net.session, ready = net.ready }, NET_PROTOCOL)
+      return true
+    end)
+  end
+  btn("LEAVE LOBBY", x0 + 27, 35, 25, 3, colors.lightGray, function()
+    leaveLobby()
+    return true
+  end)
+  put(x0, 40, "Host authoritative; password is not encrypted.", colors.lightGray)
+end
+
+local function drawJoiningPage()
+  local x0 = mx()
+  title("CONNECTING")
+  put(x0, 15, menuMsg:sub(1, MW), colors.white)
+  put(x0, 18, "Waiting for the lobby host...", colors.lightGray)
+  btn("CANCEL", x0, 42, MW, 3, colors.lightGray, function()
+    if joinTimer then os.cancelTimer(joinTimer); joinTimer = nil end
+    net = { role = "single" }
+    menuPage = "browser"
+    menuMsg = "Join cancelled"
+    return true
+  end)
 end
 
 local function drawCreatePage()
@@ -1756,24 +2432,34 @@ local function drawCreatePage()
   btn("CREATE", x0, 32, MW, 5, colors.white, function() createMsg = createCountry(); return true end)
   put(x0, 38, createMsg:sub(1, MW), colors.white)
   btn("DELETE LAST", x0, 40, 25, 3, colors.lightGray, function() createMsg = removeLastCustom(); return true end)
-  btn("BACK", x0 + 27, 40, 25, 3, colors.lightGray, function() menuPage = "main"; return true end)
+  btn("BACK", x0 + 27, 40, 25, 3, colors.lightGray, function() menuPage = menuReturnPage; return true end)
 
   local names = {}
   for _, cc in ipairs(custom) do names[#names + 1] = cc.name end
   put(x0, 44, ("Your countries: " .. (#names > 0 and table.concat(names, ", ") or "none")):sub(1, MW), colors.lightGray)
 end
 
-local function drawMenu()
+drawMenu = function()
   mon.setBackgroundColor(colors.black)
   mon.clear()
   buttons = {}
   if menuPage == "settings" then drawSettingsPage()
   elseif menuPage == "create" then drawCreatePage()
+  elseif menuPage == "lobby" then drawLobbyPage()
+  elseif menuPage == "single" then drawSinglePage()
+  elseif menuPage == "multi" then drawMultiPage()
+  elseif menuPage == "browser" then drawLobbyBrowserPage()
+  elseif menuPage == "password" then drawPasswordPage()
+  elseif menuPage == "joining" then drawJoiningPage()
   else drawMainPage() end
 end
 
 enterMenu = function()
   if picking then endPick(nil); return end
+  if net.role ~= "single" and net.started then
+    msgText = "Multiplayer game: use PAUSE; the host controls time"
+    return
+  end
   inTech, inBuild = false, false
   inMenu = true
   paused = true
@@ -1785,7 +2471,8 @@ local function onMenuTouch(x, y)
   for _, bt in ipairs(buttons) do
     if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
       bt.fn()
-      if inMenu and not quit then drawMenu() end
+      if inMenu and not quit then drawMenu()
+      elseif not inMenu then redrawAll() end
       return
     end
   end
@@ -1803,22 +2490,48 @@ local function run()
     local ev, a, b, c = os.pullEvent()
     if ev == "monitor_touch" and a == monName then
       if inMenu then onMenuTouch(b, c)
-      elseif inTech then onTechTouch(b, c)
-      elseif inBuild then onBuildTouch(b, c)
-      else onTouch(b, c) end
+      elseif inTech then
+        onTechTouch(b, c)
+        if net.role == "host" and net.started then sendNetSnapshot() end
+      elseif inBuild then
+        onBuildTouch(b, c)
+        if net.role == "host" and net.started then sendNetSnapshot() end
+      else
+        onTouch(b, c)
+        if net.role == "host" and net.started then sendNetSnapshot() end
+      end
+    elseif ev == "timer" and a == browserScanTimer then
+      browserScanTimer = nil
+      menuMsg = #lobbyBrowser > 0 and "Tap a lobby to join" or "No lobbies found; tap REFRESH"
+      if inMenu and menuPage == "browser" then drawMenu() end
+    elseif ev == "timer" and a == joinTimer then
+      joinTimer = nil
+      net = { role = "single" }
+      menuPage, menuMsg = "browser", "No response from the lobby host"
+      if inMenu then drawMenu() end
     elseif ev == "timer" and a == timerId and not inMenu and not inTech and not inBuild then
-      advanceDay()
-      if dirty then drawMap() end
-      drawTopBar()
-      drawPanel()
+      if net.role ~= "client" then
+        advanceDay()
+        if dirty then drawMap() end
+        drawTopBar()
+        drawPanel()
+        if net.role == "host" and net.started then sendNetSnapshot() end
+      end
       restartTimer()
+    elseif ev == "rednet_message" and c == NET_PROTOCOL then
+      handleNetMessage(a, b)
+      if inMenu then drawMenu()
+      elseif inTech then drawTechScreen()
+      elseif inBuild then drawBuildScreen()
+      else redrawAll() end
     elseif ev == "monitor_resize" and a == monName then
       layout()
       if inMenu then drawMenu() elseif inTech then drawTechScreen() elseif inBuild then drawBuildScreen() else redrawAll() end
     elseif ev == "key" and a == keys.q then
-      return
+      quit = true
     end
   end
+  if net.role ~= "single" then leaveLobby() end
 end
 
 local ok, err = pcall(run)
