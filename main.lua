@@ -157,8 +157,7 @@ for i, p in ipairs(provinces) do initialOwner[i] = p.owner end
 local player = playable[1]               -- nil = режим наблюдателя
 local inMenu, gameStarted, quit = true, false, false
 local enterMenu                          -- определена ниже
-local drawMenu
-local onMenuTouch
+local menu = {}
 local enterTech
 local enterBuild
 local inTech, inBuild, techMsg, buildMsg, menuMsg = false, false, "", "", ""
@@ -2083,18 +2082,18 @@ end
 
 ------------------------------------------------------------ меню
 do
-local MW = 52
-local function mx() return math.max(2, math.floor((W - MW) / 2) + 1) end
+menu.MW = 52
+function menu.mx() return math.max(2, math.floor((W - menu.MW) / 2) + 1) end
 
-local function title(text)
-  local x0 = mx()
-  for r = 0, 2 do put(x0, 3 + r, string.rep(" ", MW), colors.black, colors.white) end
-  put(x0 + math.floor((MW - #text) / 2), 4, text, colors.black, colors.white)
+function menu.title(text)
+  local x0 = menu.mx()
+  for r = 0, 2 do put(x0, 3 + r, string.rep(" ", menu.MW), colors.black, colors.white) end
+  put(x0 + math.floor((menu.MW - #text) / 2), 4, text, colors.black, colors.white)
 end
 
 -- строка "< значение >" с подписью
-local function selector(label, y, text, chipColor, chipFg, minus, plus)
-  local x0 = mx()
+function menu.selector(label, y, text, chipColor, chipFg, minus, plus)
+  local x0 = menu.mx()
   put(x0, y, label, colors.lightBlue)
   btn("<", x0, y + 1, 7, 3, colors.lightGray, minus)
   for r = 0, 2 do put(x0 + 8, y + 1 + r, string.rep(" ", 36), chipFg or colors.white, chipColor or colors.black) end
@@ -2102,37 +2101,37 @@ local function selector(label, y, text, chipColor, chipFg, minus, plus)
   btn(">", x0 + 45, y + 1, 7, 3, colors.lightGray, plus)
 end
 
-local function drawMainPage()
-  local x0 = mx()
-  title("H O I - C C")
+function menu.drawMainPage()
+  local x0 = menu.mx()
+  menu.title("H O I - C C")
   put(x0 + 2, 7, "Strategy for ComputerCraft  -  server world", colors.lightGray)
-  btn("SINGLEPLAYER", x0, 13, MW, 5, colors.white, function()
+  btn("SINGLEPLAYER", x0, 13, menu.MW, 5, colors.white, function()
     menuPage, menuMsg = "single", ""
     return true
   end)
-  btn("MULTIPLAYER", x0, 21, MW, 5, colors.lightGray, function()
+  btn("MULTIPLAYER", x0, 21, menu.MW, 5, colors.lightGray, function()
     menuPage, menuMsg = "multi", ""
     return true
   end)
-  btn("QUIT", x0, 42, MW, 3, colors.lightGray, function() quit = true; return false end)
-  put(x0, 39, menuMsg:sub(1, MW), colors.white)
+  btn("QUIT", x0, 42, menu.MW, 3, colors.lightGray, function() quit = true; return false end)
+  put(x0, 39, menuMsg:sub(1, menu.MW), colors.white)
 end
 
-local function drawSinglePage()
-  local x0 = mx()
-  title("SINGLEPLAYER")
+function menu.drawSinglePage()
+  local x0 = menu.mx()
+  menu.title("SINGLEPLAYER")
   local id = playable[settings.country]
   local c = cmap[id]
   local n = 0
   for i = 1, #provinces do
     if initialOwner[i] == id then n = n + 1 end
   end
-  selector(settings.observer and "COUNTRY (ignored when observing)" or "COUNTRY", 14,
+  menu.selector(settings.observer and "COUNTRY (ignored when observing)" or "COUNTRY", 14,
     string.format("%s (%d prov)", c.name, n), c.color, c.fg,
     function() settings.country = (settings.country - 2) % #playable + 1; return true end,
     function() settings.country = settings.country % #playable + 1; return true end)
 
-  btn(gameStarted and "NEW GAME" or "START GAME", x0, 20, MW, 5, colors.white, function()
+  btn(gameStarted and "NEW GAME" or "START GAME", x0, 20, menu.MW, 5, colors.white, function()
     newGame()
     gameStarted = true
     inMenu = false
@@ -2167,41 +2166,41 @@ local function drawSinglePage()
     end)
   end
   if gameStarted then
-    btn("RESUME", x0, 34, MW, 3, colors.lightGray, function()
+    btn("RESUME", x0, 34, menu.MW, 3, colors.lightGray, function()
       inMenu = false
       redrawAll()
       return false
     end)
   end
-  btn("BACK", x0, 42, MW, 3, colors.lightGray, function() menuPage = "main"; return true end)
+  btn("BACK", x0, 42, menu.MW, 3, colors.lightGray, function() menuPage = "main"; return true end)
   put(x0, 46, "Tap buttons on the monitor. Q on the computer quits.", colors.lightGray)
 end
 
-local function drawMultiPage()
-  local x0 = mx()
-  title("MULTIPLAYER")
+function menu.drawMultiPage()
+  local x0 = menu.mx()
+  menu.title("MULTIPLAYER")
   local id = playable[settings.country]
   local country = cmap[id]
-  selector("HOST COUNTRY", 8, country.name, country.color, country.fg,
+  menu.selector("HOST COUNTRY", 8, country.name, country.color, country.fg,
     function() settings.country = (settings.country - 2) % #playable + 1; return true end,
     function() settings.country = settings.country % #playable + 1; return true end)
-  btn("CREATE GAME", x0, 16, MW, 5, colors.white, function()
+  btn("CREATE GAME", x0, 16, menu.MW, 5, colors.white, function()
     passwordInput, passwordPurpose = "", "host"
     menuPage = "password"
     return true
   end)
-  btn("LOBBY BROWSER", x0, 24, MW, 5, colors.lightGray, function()
+  btn("LOBBY BROWSER", x0, 24, menu.MW, 5, colors.lightGray, function()
     menuPage = "browser"
     beginLobbyScan()
     return true
   end)
-  btn("BACK", x0, 42, MW, 3, colors.lightGray, function() menuPage = "main"; return true end)
-  put(x0, 39, menuMsg:sub(1, MW), colors.white)
+  btn("BACK", x0, 42, menu.MW, 3, colors.lightGray, function() menuPage = "main"; return true end)
+  put(x0, 39, menuMsg:sub(1, menu.MW), colors.white)
 end
 
-local function drawLobbyBrowserPage()
-  local x0 = mx()
-  title("LOBBY BROWSER")
+function menu.drawLobbyBrowserPage()
+  local x0 = menu.mx()
+  menu.title("LOBBY BROWSER")
   local pages = math.max(1, math.ceil(#lobbyBrowser / 7))
   lobbyBrowserPage = math.max(1, math.min(pages, lobbyBrowserPage))
   put(x0, 8, string.format("LOBBIES: %d  PAGE %d/%d", #lobbyBrowser, lobbyBrowserPage, pages), colors.lightBlue)
@@ -2211,7 +2210,7 @@ local function drawLobbyBrowserPage()
     local label = string.format("%-14s %d/%d #%s %s",
       room.name:sub(1, 14), room.players, room.maxPlayers, room.code, room.hasPassword and "LOCK" or "OPEN")
     local selected = room
-    btn(label:sub(1, MW), x0, 10 + (i - first) * 4, MW, 3,
+    btn(label:sub(1, menu.MW), x0, 10 + (i - first) * 4, menu.MW, 3,
       room.mapKey == MAP_KEY and colors.lightGray or colors.gray, function()
         if selected.mapKey ~= MAP_KEY then
           menuMsg = "This lobby uses a different map"
@@ -2229,7 +2228,7 @@ local function drawLobbyBrowserPage()
   end
   local status = menuMsg
   if #lobbyBrowser == 0 and not browserScanTimer and status == "" then status = "No lobbies found; tap REFRESH" end
-  put(x0, 38, status:sub(1, MW), colors.white)
+  put(x0, 38, status:sub(1, menu.MW), colors.white)
   if lobbyBrowserPage > 1 then
     btn("PREV", x0, 40, 25, 3, colors.lightGray, function()
       lobbyBrowserPage = lobbyBrowserPage - 1
@@ -2253,9 +2252,9 @@ local function drawLobbyBrowserPage()
   end)
 end
 
-local function drawPasswordPage()
-  local x0 = mx()
-  title(passwordPurpose == "host" and "LOBBY PASSWORD" or "ENTER PASSWORD")
+function menu.drawPasswordPage()
+  local x0 = menu.mx()
+  menu.title(passwordPurpose == "host" and "LOBBY PASSWORD" or "ENTER PASSWORD")
   put(x0, 8, passwordPurpose == "host" and "Digits only, max 12; blank = public lobby" or
     ("Password for #" .. (selectedLobby and selectedLobby.code or "")), colors.lightGray)
   put(x0, 10, "PASSWORD: " .. string.rep("*", #passwordInput), colors.white)
@@ -2273,7 +2272,7 @@ local function drawPasswordPage()
       return true
     end)
   end
-  put(x0, 29, menuMsg:sub(1, MW), colors.white)
+  put(x0, 29, menuMsg:sub(1, menu.MW), colors.white)
   btn("CONTINUE", x0, 31, 25, 4, colors.white, function()
     if passwordPurpose == "host" then
       openHostLobby(passwordInput)
@@ -2290,24 +2289,24 @@ local function drawPasswordPage()
   end)
 end
 
-local function drawSettingsPage()
-  local x0 = mx()
-  title("SETTINGS")
+function menu.drawSettingsPage()
+  local x0 = menu.mx()
+  menu.title("SETTINGS")
   local y = 8
   for _, o in ipairs(OPTS) do
-    selector(o.label, y, o.vals[settings[o.key]], nil, nil,
+    menu.selector(o.label, y, o.vals[settings[o.key]], nil, nil,
       function() settings[o.key] = (settings[o.key] - 2) % #o.vals + 1; return true end,
       function() settings[o.key] = settings[o.key] % #o.vals + 1; return true end)
     y = y + 4
   end
-  btn("BACK", x0, y + 1, MW, 3, colors.lightGray, function()
+  btn("BACK", x0, y + 1, menu.MW, 3, colors.lightGray, function()
     menuPage = menuReturnPage
     return true
   end)
   put(x0, y + 5, "Changes apply to the next NEW GAME (AI, income, events apply at once).", colors.lightGray)
 end
 
-local function cycleLobbySetting(step)
+function menu.cycleLobbySetting(step)
   if net.role ~= "host" or not net.peers then return end
   local option = OPTS[net.settingsCursor]
   if not option then return end
@@ -2317,7 +2316,7 @@ local function cycleLobbySetting(step)
   sendLobbyUpdate()
 end
 
-local function leaveLobby()
+function menu.leaveLobby()
   if net.role == "client" and net.host then
     rednet.send(net.host, { v = 1, kind = "leave", session = net.session }, NET_PROTOCOL)
   elseif net.role == "host" then
@@ -2329,9 +2328,9 @@ local function leaveLobby()
   menuPage, inMenu, menuMsg = "main", true, ""
 end
 
-local function drawLobbyPage()
-  local x0 = mx()
-  title(net.role == "host" and "HOST LOBBY" or "JOINED LOBBY")
+function menu.drawLobbyPage()
+  local x0 = menu.mx()
+  menu.title(net.role == "host" and "HOST LOBBY" or "JOINED LOBBY")
   put(x0, 8, "LOBBY CODE: " .. tostring(net.code), colors.white)
   put(x0, 10, net.password and net.password ~= "" and "Password: set (not encrypted)" or "Password: none",
     colors.lightGray)
@@ -2343,7 +2342,7 @@ local function drawLobbyPage()
     local country = cmap[member.country]
     local line = string.format("%s  %s  %s",
       member.name or "Player", country and country.name or "?", member.ready and "READY" or "WAIT")
-    put(x0, 12 + i, line:sub(1, MW), member.ready and colors.lime or colors.white)
+    put(x0, 12 + i, line:sub(1, menu.MW), member.ready and colors.lime or colors.white)
   end
   if #members > 8 then put(x0, 21, "and " .. (#members - 8) .. " more", colors.lightGray) end
 
@@ -2351,14 +2350,14 @@ local function drawLobbyPage()
     local option = OPTS[net.settingsCursor]
     put(x0, 23, "HOST SETTINGS (change resets READY)", colors.lightBlue)
     if option then
-      put(x0, 25, option.label:sub(1, MW), colors.white)
+      put(x0, 25, option.label:sub(1, menu.MW), colors.white)
       btn("<", x0, 26, 12, 3, colors.lightGray, function()
-        cycleLobbySetting(-1); return true
+        menu.cycleLobbySetting(-1); return true
       end)
       local value = option.vals[settings[option.key]]
-      put(x0 + 13, 27, value:sub(1, MW - 26), colors.white)
-      btn(">", x0 + MW - 12, 26, 12, 3, colors.lightGray, function()
-        cycleLobbySetting(1); return true
+      put(x0 + 13, 27, value:sub(1, menu.MW - 26), colors.white)
+      btn(">", x0 + menu.MW - 12, 26, 12, 3, colors.lightGray, function()
+        menu.cycleLobbySetting(1); return true
       end)
       btn("SETTING -", x0, 30, 25, 3, colors.lightGray, function()
         net.settingsCursor = (net.settingsCursor - 2) % #OPTS + 1
@@ -2388,18 +2387,18 @@ local function drawLobbyPage()
     end)
   end
   btn("LEAVE LOBBY", x0 + 27, 35, 25, 3, colors.lightGray, function()
-    leaveLobby()
+    menu.leaveLobby()
     return true
   end)
   put(x0, 40, "Host authoritative; password is not encrypted.", colors.lightGray)
 end
 
-local function drawJoiningPage()
-  local x0 = mx()
-  title("CONNECTING")
-  put(x0, 15, menuMsg:sub(1, MW), colors.white)
+function menu.drawJoiningPage()
+  local x0 = menu.mx()
+  menu.title("CONNECTING")
+  put(x0, 15, menuMsg:sub(1, menu.MW), colors.white)
   put(x0, 18, "Waiting for the lobby host...", colors.lightGray)
-  btn("CANCEL", x0, 42, MW, 3, colors.lightGray, function()
+  btn("CANCEL", x0, 42, menu.MW, 3, colors.lightGray, function()
     if joinTimer then os.cancelTimer(joinTimer); joinTimer = nil end
     net = { role = "single" }
     menuPage = "browser"
@@ -2408,52 +2407,52 @@ local function drawJoiningPage()
   end)
 end
 
-local function drawCreatePage()
-  local x0 = mx()
-  title("CREATE COUNTRY")
+function menu.drawCreatePage()
+  local x0 = menu.mx()
+  menu.title("CREATE COUNTRY")
   local ch = colorChoices[draft.color]
 
   put(x0, 8, "NAME", colors.lightBlue)
-  for r = 0, 2 do put(x0, 9 + r, string.rep(" ", MW), ch.fg, ch.color) end
-  put(x0 + math.floor((MW - #draft.name) / 2), 10, draft.name, ch.fg, ch.color)
+  for r = 0, 2 do put(x0, 9 + r, string.rep(" ", menu.MW), ch.fg, ch.color) end
+  put(x0 + math.floor((menu.MW - #draft.name) / 2), 10, draft.name, ch.fg, ch.color)
   btn("RANDOM NAME", x0, 13, 25, 3, colors.lightGray, function() draft.name = randomName(); return true end)
   btn("TYPE ON COMPUTER", x0 + 27, 13, 25, 3, colors.lightGray, function() askName(); return true end)
 
-  selector("COLOR (map palette)", 17, string.format("color %d of %d", draft.color, #colorChoices), ch.color, ch.fg,
+  menu.selector("COLOR (map palette)", 17, string.format("color %d of %d", draft.color, #colorChoices), ch.color, ch.fg,
     function() draft.color = (draft.color - 2) % #colorChoices + 1; return true end,
     function() draft.color = draft.color % #colorChoices + 1; return true end)
 
   put(x0, 22, "CAPITAL", colors.lightBlue)
-  btn(draft.cap and provinces[draft.cap].name or "PICK ON MAP", x0, 23, MW, 3, colors.lightGray,
+  btn(draft.cap and provinces[draft.cap].name or "PICK ON MAP", x0, 23, menu.MW, 3, colors.lightGray,
     function() startPick(); return false end)
 
-  selector("SIZE (provinces)", 27, tostring(draft.size), nil, nil,
+  menu.selector("SIZE (provinces)", 27, tostring(draft.size), nil, nil,
     function() draft.size = math.max(1, draft.size - 1); return true end,
     function() draft.size = math.min(6, draft.size + 1); return true end)
 
-  btn("CREATE", x0, 32, MW, 5, colors.white, function() createMsg = createCountry(); return true end)
-  put(x0, 38, createMsg:sub(1, MW), colors.white)
+  btn("CREATE", x0, 32, menu.MW, 5, colors.white, function() createMsg = createCountry(); return true end)
+  put(x0, 38, createMsg:sub(1, menu.MW), colors.white)
   btn("DELETE LAST", x0, 40, 25, 3, colors.lightGray, function() createMsg = removeLastCustom(); return true end)
   btn("BACK", x0 + 27, 40, 25, 3, colors.lightGray, function() menuPage = menuReturnPage; return true end)
 
   local names = {}
   for _, cc in ipairs(custom) do names[#names + 1] = cc.name end
-  put(x0, 44, ("Your countries: " .. (#names > 0 and table.concat(names, ", ") or "none")):sub(1, MW), colors.lightGray)
+  put(x0, 44, ("Your countries: " .. (#names > 0 and table.concat(names, ", ") or "none")):sub(1, menu.MW), colors.lightGray)
 end
 
-drawMenu = function()
+menu.draw = function()
   mon.setBackgroundColor(colors.black)
   mon.clear()
   buttons = {}
-  if menuPage == "settings" then drawSettingsPage()
-  elseif menuPage == "create" then drawCreatePage()
-  elseif menuPage == "lobby" then drawLobbyPage()
-  elseif menuPage == "single" then drawSinglePage()
-  elseif menuPage == "multi" then drawMultiPage()
-  elseif menuPage == "browser" then drawLobbyBrowserPage()
-  elseif menuPage == "password" then drawPasswordPage()
-  elseif menuPage == "joining" then drawJoiningPage()
-  else drawMainPage() end
+  if menuPage == "settings" then menu.drawSettingsPage()
+  elseif menuPage == "create" then menu.drawCreatePage()
+  elseif menuPage == "lobby" then menu.drawLobbyPage()
+  elseif menuPage == "single" then menu.drawSinglePage()
+  elseif menuPage == "multi" then menu.drawMultiPage()
+  elseif menuPage == "browser" then menu.drawLobbyBrowserPage()
+  elseif menuPage == "password" then menu.drawPasswordPage()
+  elseif menuPage == "joining" then menu.drawJoiningPage()
+  else menu.drawMainPage() end
 end
 
 enterMenu = function()
@@ -2466,14 +2465,14 @@ enterMenu = function()
   inMenu = true
   paused = true
   timerId = nil
-  drawMenu()
+  menu.draw()
 end
 
-onMenuTouch = function(x, y)
+menu.onTouch = function(x, y)
   for _, bt in ipairs(buttons) do
     if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
       bt.fn()
-      if inMenu and not quit then drawMenu()
+      if inMenu and not quit then menu.draw()
       elseif not inMenu then redrawAll() end
       return
     end
@@ -2487,12 +2486,12 @@ local function run()
   loadWorld()
   buildLinks()
   loadCustom()
-  drawMenu()
+  menu.draw()
 
   while not quit do
     local ev, a, b, c = os.pullEvent()
     if ev == "monitor_touch" and a == monName then
-      if inMenu then onMenuTouch(b, c)
+      if inMenu then menu.onTouch(b, c)
       elseif inTech then
         onTechTouch(b, c)
         if net.role == "host" and net.started then sendNetSnapshot() end
@@ -2506,12 +2505,12 @@ local function run()
     elseif ev == "timer" and a == browserScanTimer then
       browserScanTimer = nil
       menuMsg = #lobbyBrowser > 0 and "Tap a lobby to join" or "No lobbies found; tap REFRESH"
-      if inMenu and menuPage == "browser" then drawMenu() end
+      if inMenu and menuPage == "browser" then menu.draw() end
     elseif ev == "timer" and a == joinTimer then
       joinTimer = nil
       net = { role = "single" }
       menuPage, menuMsg = "browser", "No response from the lobby host"
-      if inMenu then drawMenu() end
+      if inMenu then menu.draw() end
     elseif ev == "timer" and a == timerId and not inMenu and not inTech and not inBuild then
       if net.role ~= "client" then
         advanceDay()
@@ -2523,18 +2522,18 @@ local function run()
       restartTimer()
     elseif ev == "rednet_message" and c == NET_PROTOCOL then
       handleNetMessage(a, b)
-      if inMenu then drawMenu()
+      if inMenu then menu.draw()
       elseif inTech then drawTechScreen()
       elseif inBuild then drawBuildScreen()
       else redrawAll() end
     elseif ev == "monitor_resize" and a == monName then
       layout()
-      if inMenu then drawMenu() elseif inTech then drawTechScreen() elseif inBuild then drawBuildScreen() else redrawAll() end
+      if inMenu then menu.draw() elseif inTech then drawTechScreen() elseif inBuild then drawBuildScreen() else redrawAll() end
     elseif ev == "key" and a == keys.q then
       quit = true
     end
   end
-  if net.role ~= "single" then leaveLobby() end
+  if net.role ~= "single" then menu.leaveLobby() end
 end
 
 local ok, err = pcall(run)
