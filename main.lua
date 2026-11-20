@@ -2282,13 +2282,15 @@ local function onTouch(x, y)
 end
 
 ------------------------------------------------------------ экран технологий
-local BRANCHES = { "Industry", "Army", "Logistics", "Society" }
-local EFF_LABEL = { pp = "income", atk = "attack", def = "defense", rp = "research", sea = "sea time",
-                    cost = "unit cost" }
+menu.branches = { "Industry", "Army", "Logistics", "Society" }
+menu.effectLabels = { pp = "income", atk = "attack", def = "defense", rp = "research", sea = "sea time",
+                      cost = "unit cost" }
 
-local function pct(v) return v >= 0 and math.floor(v * 100 + 0.5) or -math.floor(-v * 100 + 0.5) end
+menu.pct = function(v)
+  return v >= 0 and math.floor(v * 100 + 0.5) or -math.floor(-v * 100 + 0.5)
+end
 
-local function effText(t)
+menu.effText = function(t)
   local parts = {}
   for k, v in pairs(t.eff) do
     if k == "march" then
@@ -2298,14 +2300,14 @@ local function effText(t)
     elseif k == "cap" then
       parts[#parts + 1] = string.format("+%d division cap", v)
     else
-      parts[#parts + 1] = string.format("%+d%% %s", pct(v), EFF_LABEL[k] or k)
+      parts[#parts + 1] = string.format("%+d%% %s", menu.pct(v), menu.effectLabels[k] or k)
     end
   end
   table.sort(parts)
   return table.concat(parts, ", ")
 end
 
-local function drawTechScreen(keepScreen)
+menu.drawTechScreen = function(keepScreen)
   mon.setBackgroundColor(colors.black)
   if not keepScreen then mon.clear() end
   buttons = {}
@@ -2315,7 +2317,7 @@ local function drawTechScreen(keepScreen)
   for r = 0, 2 do put(x0, 3 + r, string.rep(" ", cw * 4 + 3), colors.black, colors.white) end
   put(x0 + 2, 4, string.format("TECHNOLOGY  -  %s     RP %d  (+%.1f per day)", cmap[player].name,
     math.floor(st.rp), researchRate(player)), colors.black, colors.white)
-  for bi, br in ipairs(BRANCHES) do
+  for bi, br in ipairs(menu.branches) do
     local cx = x0 + (bi - 1) * (cw + 1)
     put(cx, 8, br:upper(), colors.lightBlue)
     local y = 10
@@ -2326,7 +2328,7 @@ local function drawTechScreen(keepScreen)
         local fg = (state == "locked") and colors.white or colors.black
         for r = 0, 3 do put(cx, y + r, string.rep(" ", cw), fg, col) end
         put(cx + 1, y, t.name:sub(1, cw - 2), fg, col)
-        put(cx + 1, y + 1, effText(t):sub(1, cw - 2), fg, col)
+        put(cx + 1, y + 1, menu.effText(t):sub(1, cw - 2), fg, col)
         local line3
         if state == "owned" then line3 = "RESEARCHED"
         elseif state == "locked" then line3 = "needs " .. TECH_BY_ID[t.req].name
@@ -2377,7 +2379,7 @@ menu.drawPolitics = function()
   put(x0, 32, techMsg:sub(1, menu.MW), colors.white)
   btn("BACK TO RESEARCH", x0, 36, menu.MW, 3, colors.lightGray, function()
     menu.inPolitics = false
-    drawTechScreen()
+    menu.drawTechScreen()
     return false
   end)
 end
@@ -2388,10 +2390,10 @@ enterTech = function()
   inTech, paused, timerId = true, true, nil
   menu.inPolitics = false
   techMsg = "Tap a technology to research it"
-  drawTechScreen()
+  menu.drawTechScreen()
 end
 
-local function onTechTouch(x, y)
+menu.onTechTouch = function(x, y)
   if menu.inLog then
     for _, bt in ipairs(buttons) do
       if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then bt.fn(); return end
@@ -2411,7 +2413,7 @@ local function onTechTouch(x, y)
     if x >= bt.x1 and x <= bt.x2 and y >= bt.y1 and y <= bt.y2 then
       bt.fn()
       if inTech then
-        if menu.inPolitics then menu.drawPolitics() else drawTechScreen() end
+        if menu.inPolitics then menu.drawPolitics() else menu.drawTechScreen() end
       end
       return
     end
@@ -3194,7 +3196,7 @@ local function run()
     if ev == "monitor_touch" and a == monName then
       if inMenu then menu.onTouch(b, c)
       elseif inTech then
-        onTechTouch(b, c)
+        menu.onTechTouch(b, c)
         if net.role == "host" and net.started then sendNetSnapshot() end
       elseif inBuild then
         onBuildTouch(b, c)
@@ -3245,7 +3247,7 @@ local function run()
       elseif inTech then
         if menu.inLog then menu.drawReports(true)
         elseif menu.inPolitics then menu.drawPolitics()
-        else drawTechScreen(true) end
+        else menu.drawTechScreen(true) end
       elseif inBuild then drawBuildScreen(true)
       else
         drawMap()
@@ -3258,7 +3260,7 @@ local function run()
       elseif inTech then
         if menu.inLog then menu.drawReports()
         elseif menu.inPolitics then menu.drawPolitics()
-        else drawTechScreen() end
+        else menu.drawTechScreen() end
       elseif inBuild then drawBuildScreen() else redrawAll() end
     elseif ev == "char" and chat.active then
       if #chat.input < 100 then chat.input = (chat.input .. a):sub(1, 100) end
